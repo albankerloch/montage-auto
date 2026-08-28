@@ -77,6 +77,16 @@ On ne décrit aucun ordre d'exécution : on déclare qui dépend de quoi. Chaque
 nœud porte une clé `sha256(nom + version + params + clés des dépendances)`, et
 demander un artefact matérialise ce qui manque.
 
+Vue d'ensemble, sept étapes :
+
+```
+①scenes → ②thumbs → ③{ metrics ∥ annot } → ④segments → ⑤candidates (CP-SAT) → ⑥ranked (tournoi) → ⑦monteur + export
+```
+
+Et le graphe de dépendances réel — `③` est en fait deux nœuds frères, pas une
+étape séquentielle, et `⑦` (le monteur) ne s'intercale nulle part : il rejoue
+`candidates` avec `--ban`/`--pin` en paramètres, il ne suit pas `ranked` :
+
 ```
 rush ─┬─ probe ─────────────────────────────────┐
       │                                         │
@@ -90,15 +100,47 @@ rush ─┬─ probe ───────────────────�
                                                                      │
                                                                      ├─ alternates
                                                                      ├─ render
-                                                                     └─ exports ──► NLE
+                                                                     └─ exports ──► NLE (Resolve)
                                                                                      │
                                                                      conform ◄───────┘
 ```
 
-`ranked` s'exécute toujours, y compris en `--rank manual` : c'est le mode qui
-supprime l'appel au modèle, pas un contournement du nœud. `alternates` en dépend
-donc, et non de `candidates`. `conform` n'est pas un nœud du graphe mais un
-outil séparé, qui relit ce que le NLE a produit.
+(① = `scenes`, ② = `thumbs`, ③ = `metrics` + `annot`, ④ = `segments`,
+⑤ = `candidates`, ⑥ = `ranked`, ⑦ = le monteur — `--ban`/`--pin`, puis export.)
+
+1. **Découper chaque rush en plans** (`scenes`) — détection des coupures
+   (filtre `scene` de ffmpeg), échantillonnées uniformément sur toute la durée
+   si le rush dépasse `MAX_SEGMENTS_PER_RUSH` plans.
+2. **Extraire une vignette par plan** (`thumbs`) — une image 640 px, la seule
+   chose que le modèle de vision verra jamais.
+3. **Mesurer et juger, en parallèle et sans se mélanger** (`metrics` + `annot`)
+   — `metrics` calcule netteté, exposition, stabilité sur les pixels
+   d'origine, sans aucun modèle ; `annot` envoie les vignettes à Haiku, qui
+   juge l'intérêt du cadre, l'émotion, le rôle narratif. Les deux nœuds sont
+   frères, pas l'un en aval de l'autre : un plan peut être narrativement
+   indispensable et techniquement médiocre, ce n'est pas au modèle de
+   trancher.
+4. **Fusionner en une liste de plans exploitables** (`segments`) — c'est le
+   seul nœud qui ne prend aucun paramètre de montage : il porte le résultat de
+   la vision, le poste de coût, et rien ne doit pouvoir le réinvalider par
+   accident. Un plan dont l'annotation a échoué est écarté, jamais maquillé en
+   donnée valide.
+5. **Résoudre le puzzle sous contraintes** (`candidates`) — CP-SAT choisit et
+   ordonne les plans (durée cible, pas de répétition, pas deux plans de la
+   même source à la suite, ouverture/clôture par rôle, positions imposées par
+   `--pin`…), pour chacune des intentions du faisceau (`--presets`), K
+   solutions distinctes par intention.
+6. **Classer par tournoi** (`ranked`) — Sonnet compare deux candidats à la
+   fois sur leurs raccords et désigne un gagnant, jusqu'à classer tout le
+   faisceau. Ce nœud s'exécute toujours, y compris en `--rank manual` : c'est
+   le mode qui supprime l'appel au modèle (le classement revient au monteur),
+   pas un contournement du nœud — `alternates` dépend donc de `ranked`, et non
+   de `candidates`.
+7. **Le monteur tranche, puis ça sort** — veto (`--ban`) ou pin (`--pin`),
+   rejeu ; le candidat retenu part en mp4 (`render`), EDL/FCPXML/plan JSON
+   (`exports`), ou directement dans une timeline DaVinci Resolve ouverte
+   (`--resolve`). `conform` n'est pas un nœud du graphe mais un outil séparé,
+   qui relit ce que le NLE a produit et le retraduit en vetos.
 
 Trois principes portent le reste.
 
@@ -145,6 +187,27 @@ dans le bon sens : `analyzer.py` importe le contrat `SegmentSemantics` depuis
 | `render` / `exports` | mp4, EDL, FCPXML, plan JSON du candidat retenu | local |
 
 Deux nœuds seulement sortent sur le réseau. Le reste est local et reproductible.
+
+### Coût & latence (`src/usage.py`)
+
+`annot` et `ranked` sont les deux seuls nœuds facturés ; chaque appel de
+`BaseAgent.call` chronomètre la requête et lit `response.usage`, dans un
+accumulateur global réinitialisé au début de chaque `Run` — pas dans le
+cache, où un chiffre gelé la première fois mentirait à chaque relecture. Le
+rapport s'affiche en fin de run :
+
+```
+── Coût & latence (API, ce run) ────────────────────────
+  AnnotatorAgent      14 appel(s)   38200 in /   6100 out tok    22.4s  $0.0687
+  ComparatorAgent       9 appel(s)   12400 in /   2300 out tok    18.9s  $0.0717
+  total                23 appel(s)   50600 in /   8400 out tok    41.3s  $0.1404
+```
+
+Les tarifs (`MODEL_PRICING_PER_MTOK` dans `src/config.py`) sont indicatifs :
+l'API ne les expose pas, un modèle absent de la table compte pour $0 plutôt
+que pour un prix deviné. Un nœud servi par le cache ne fait aucun appel, donc
+n'apparaît pas dans ce rapport — c'est la même logique que la colonne « Coût »
+ci-dessus.
 
 ### Le graphe (`src/graph.py`, `src/nodes.py`)
 
@@ -234,12 +297,24 @@ python -m src.main rushes/ --rank manual
 # 2. choisir, et retirer les plans qu'on ne veut pas voir
 python -m src.main rushes/ --pick 2 --ban rush_0@12.250,rush_1@3.000
 python -m src.main rushes/ --ban-file bans.json
+
+# 3. ou imposer un plan à une position (contrainte dure, pas une suggestion)
+python -m src.main rushes/ --pin rush_0@12.250=0 --pin rush_2@8.400=last
+python -m src.main rushes/ --pin-file pins.json
 ```
 
-Les clés de veto sont celles qu'affiche le rapport d'assemblage et que porte
-`source_key` dans le plan JSON exporté — pas un identifiant interne à
-reconstituer. Une clé qui ne correspond à rien fait échouer le run : l'ignorer
-rendrait un montage inchangé et laisserait croire au veto.
+Les clés de veto et de pin sont celles qu'affiche le rapport d'assemblage et
+que porte `source_key` dans le plan JSON exporté — pas un identifiant interne
+à reconstituer. Une clé qui ne correspond à rien fait échouer le run : l'ignorer
+rendrait un montage inchangé et laisserait croire au veto (ou au pin).
+
+`--pin` prend `CLE=POSITION`, POSITION étant un entier 0-based ou `first`/
+`last`. C'est une ligne de CP-SAT (`x[i][position] == 1`), donc garanti —
+contrairement à un prompt qui ne ferait que suggérer. Un pin incompatible avec
+les autres contraintes du preset (chronologie stricte, deux plans pinnés à la
+même position, position hors bornes pour la durée cible) rend le candidat
+infaisable : il disparaît du faisceau plutôt que de rendre un montage qui
+l'ignore silencieusement.
 
 `--rank manual` mérite d'être le défaut sur un vrai projet. « Lequel des deux tu
 livrerais » est une question de monteur, et l'automatiser était le dernier
@@ -453,16 +528,11 @@ noté que sur trois images, et rien de réutilisable d'un run à l'autre.
 - **Aucune inférence locale.** Les vignettes partent chez Anthropic. Basculer
   l'annotation sur un VLM local n'invaliderait que les nœuds `annot` — le
   paramètre existe — mais l'écart de qualité n'a pas été mesuré.
-- **Pas de « pin ».** On peut retirer un plan, pas en imposer un à une position
-  donnée. Ce serait une ligne de CP-SAT, et le meilleur argument contre un
-  prompt : une contrainte est garantie, une suggestion ne l'est pas.
 - **Seuils des métriques non calibrés** sur de vrais rushes (cf. plus haut).
 - Le comparateur juge des images fixes de raccord, pas le mouvement : un faux
   raccord sur un travelling lui échappe encore.
 - Aucune notion de multicam : ni synchronisation, ni choix d'angle sur action
   simultanée.
-- **Coût et latence non instrumentés.** `response.usage` n'est lu nulle part,
-  donc aucun chiffre de bout en bout n'est disponible.
 - La détection de scènes repose sur le filtre `scene` de ffmpeg (différence
   d'histogramme), pas sur un modèle de vision dédié : elle rate les coupes
   franches entre plans visuellement proches.

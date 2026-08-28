@@ -4,6 +4,8 @@ import time
 import anthropic
 from pydantic import BaseModel
 
+from src.usage import usage
+
 
 def _flatten_schema(schema: dict) -> dict:
     """
@@ -68,6 +70,7 @@ class BaseAgent:
         last_error = None
         for attempt in range(max_retries):
             try:
+                t0 = time.perf_counter()
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=max_tokens,
@@ -81,6 +84,16 @@ class BaseAgent:
                         }
                     ],
                     tool_choice={"type": "any"},
+                )
+                # Le temps d'attente d'un retry (backoff) n'est pas de la
+                # latence d'appel, et une tentative qui échoue n'est pas
+                # facturée : on ne chronomètre/journalise que l'appel réussi.
+                usage.record(
+                    agent=self.__class__.__name__,
+                    model=self.model,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    latency_s=time.perf_counter() - t0,
                 )
                 break  # success
             except (anthropic.OverloadedError, anthropic.RateLimitError) as e:

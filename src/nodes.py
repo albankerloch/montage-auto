@@ -165,15 +165,18 @@ def _candidates(
     time_limit_s: float,
     banned: list[str],
     dedupe_threshold: float,
+    pinned: dict[str, "int | str"] | None = None,
 ) -> list[dict]:
     from src import beam
     from src.assemble import solve
 
     segs = AnalysisResult.model_validate(analysis).segments
+    pinned = pinned or {}
+
+    available = {segment_key(s.source_file, s.start_time) for s in segs}
 
     blocked: frozenset[str] = frozenset(banned)
     if blocked:
-        available = {segment_key(s.source_file, s.start_time) for s in segs}
         unknown = sorted(blocked - available)
         if unknown:
             # Une clé qui ne matche rien est presque toujours une faute de
@@ -183,6 +186,22 @@ def _candidates(
                 "Clé(s) de veto inconnue(s) : " + ", ".join(unknown)
                 + f"\n{len(available)} segments disponibles, p. ex. : "
                 + ", ".join(sorted(available)[:3])
+            )
+
+    if pinned:
+        unknown_pins = sorted(set(pinned) - available)
+        if unknown_pins:
+            raise ValueError(
+                "Clé(s) de pin inconnue(s) : " + ", ".join(unknown_pins)
+                + f"\n{len(available)} segments disponibles, p. ex. : "
+                + ", ".join(sorted(available)[:3])
+            )
+        contradictory = sorted(set(pinned) & blocked)
+        if contradictory:
+            # Imposé ET banni : ce n'est pas au système de trancher lequel
+            # des deux ordres du monteur l'emporte.
+            raise ValueError(
+                "Clé(s) à la fois pinnée(s) et bannie(s) : " + ", ".join(contradictory)
             )
 
     out: list[Candidate] = []
@@ -196,6 +215,7 @@ def _candidates(
                 k=k_per_preset,
                 time_limit_s=time_limit_s,
                 excluded=blocked,
+                pinned=pinned,
             )
         )
     return [c.model_dump(mode="json") for c in beam.dedupe(out, threshold=dedupe_threshold)]
@@ -319,6 +339,7 @@ def build(
     k_per_preset: int = 2,
     solver_time_limit_s: float = 15.0,
     banned_segments: Sequence[str] = (),
+    pinned_segments: dict[str, "int | str"] | None = None,
     dedupe_threshold: float = 0.85,
     max_candidates: int = 6,
     per_preset_prefilter: int = 1,
@@ -402,6 +423,7 @@ def build(
             "k_per_preset": k_per_preset,
             "time_limit_s": solver_time_limit_s,
             "banned": sorted(banned_segments),
+            "pinned": dict(sorted((pinned_segments or {}).items())),
             "dedupe_threshold": dedupe_threshold,
         },
         version=V["candidates"],

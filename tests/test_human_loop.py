@@ -86,6 +86,57 @@ def test_unknown_ban_key_is_rejected():
         )
 
 
+def test_unknown_pin_key_is_rejected():
+    """Même logique que le veto : une clé de pin qui ne matche rien est une
+    faute de frappe, pas une intention à ignorer silencieusement."""
+    from src import nodes
+    from src.models import AnalysisResult
+
+    analysis = AnalysisResult(
+        segments=list(SEGS[:8]),
+        total_rushes_duration=100.0,
+        recommended_output_duration=60.0,
+        summary="",
+    ).model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="inconnue"):
+        nodes._candidates(
+            analysis=analysis,
+            presets=[PRESETS["punchy"].model_dump()],
+            k_per_preset=1,
+            time_limit_s=3.0,
+            banned=[],
+            dedupe_threshold=0.85,
+            pinned={"rush_0@9.0": 0},  # 1 décimale au lieu de 3
+        )
+
+
+def test_pinning_and_banning_the_same_key_is_rejected():
+    """Imposé et banni à la fois : ce n'est pas au système de trancher lequel
+    des deux ordres du monteur l'emporte."""
+    from src import nodes
+    from src.models import AnalysisResult
+
+    key = segment_key(SEGS[0].source_file, SEGS[0].start_time)
+    analysis = AnalysisResult(
+        segments=list(SEGS[:8]),
+        total_rushes_duration=100.0,
+        recommended_output_duration=60.0,
+        summary="",
+    ).model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="bannie"):
+        nodes._candidates(
+            analysis=analysis,
+            presets=[PRESETS["punchy"].model_dump()],
+            k_per_preset=1,
+            time_limit_s=3.0,
+            banned=[key],
+            dedupe_threshold=0.85,
+            pinned={key: 0},
+        )
+
+
 def test_segment_key_matches_what_the_report_prints():
     from src.assemble import explain
 

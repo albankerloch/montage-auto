@@ -192,6 +192,25 @@ class Candidate(BaseModel):
         return frozenset(p.index for p in self.picks)
 
 
+def _last_used_position(model: cp_model.CpModel, used: list, n_pos: int) -> list:
+    """BoolVar par position, vrai ssi c'est la dernière position occupée.
+
+    Factorisé hors de `require_closing_last` : le pin `"last"` a besoin
+    exactement de la même notion (la timeline n'occupe pas forcément les
+    `n_pos` positions disponibles, donc « la dernière » n'est pas `n_pos - 1`).
+    """
+    is_last = []
+    for p in range(n_pos):
+        v = model.NewBoolVar(f"last_{p}")
+        if p == n_pos - 1:
+            model.Add(v == used[p])
+        else:
+            model.AddBoolAnd([used[p], used[p + 1].Not()]).OnlyEnforceIf(v)
+            model.AddBoolOr([used[p].Not(), used[p + 1]]).OnlyEnforceIf(v.Not())
+        is_last.append(v)
+    return is_last
+
+
 def _trim(seg: VideoSegment, preset: Preset) -> tuple[float, float]:
     """Ramène un segment dans [min_shot, max_shot], centré sur son milieu."""
     dur = max(0.0, seg.end_time - seg.start_time)
@@ -228,6 +247,7 @@ def solve(
     time_limit_s: float = 15.0,
     deterministic: bool = True,
     excluded: frozenset[str] = frozenset(),
+    pinned: dict[str, int | Literal["first", "last"]] | None = None,
 ) -> list[Candidate]:
     """Retourne jusqu'à `k` timelines distinctes, classées par objectif.
 
@@ -237,6 +257,12 @@ def solve(
     pointeraient vers d'autres plans. C'est le même piège que l'appariement par
     index de l'ancien ANALYZER, et il s'était refermé pareil.
 
+    `pinned` impose un plan à une position (index 0-based, ou `"first"` /
+    `"last"`) — une clé absente du dict n'est pas contrainte. Un pin
+    incompatible avec les autres contraintes (chronologie, source déjà
+    présente à la position adjacente…) rend le modèle infaisable : `solve`
+    retourne alors `[]`, comme toute instance sans solution.
+
     `deterministic=True` n'est pas un confort : le cache de `src/graph.py` est
     adressé par contenu, donc une fonction non déterministe le rend menteur —
     la valeur relue diffère de la valeur qu'un recalcul produirait. CP-SAT en
@@ -244,6 +270,7 @@ def solve(
     on passe donc à un worker et à une limite en temps *déterministe* (unités
     de travail, pas de secondes), au prix de la vitesse.
     """
+    pinned = pinned or {}
     usable = [
         (i, s, *_trim(s, preset))
         for i, s in enumerate(segments)
@@ -313,14 +340,46 @@ def solve(
             if (s.suggested_role or "").lower() in ("resolution", "outro")
         ]
         if closers:
+            is_last = _last_used_position(model, used, n_pos)
             for p in range(n_pos):
-                is_last = model.NewBoolVar(f"last_{p}")
-                if p == n_pos - 1:
-                    model.Add(is_last == used[p])
-                else:
-                    model.AddBoolAnd([used[p], used[p + 1].Not()]).OnlyEnforceIf(is_last)
-                    model.AddBoolOr([used[p].Not(), used[p + 1]]).OnlyEnforceIf(is_last.Not())
-                model.Add(sum(x[i][p] for i in closers) == 1).OnlyEnforceIf(is_last)
+                model.Add(sum(x[i][p] for i in closers) == 1).OnlyEnforceIf(is_last[p])
+
+    if pinned:
+        # Le monteur impose un plan à une position donnée : une contrainte
+        # dure, garantie par le solveur — pas une suggestion qu'un LLM
+        # pourrait ignorer. `key_to_i` est bâti sur `usable`, donc une clé
+        # bannie ou trop courte pour `min_shot` n'y figure pas.
+        key_to_i = {segment_key(s.source_file, s.start_time): i for i, s in enumerate(segs)}
+        is_last_pin: list | None = None
+        seen_positions: dict[int, str] = {}
+        for key, pos in pinned.items():
+            if key not in key_to_i:
+                raise ValueError(
+                    f"clé de pin inconnue ou inutilisable : {key}"
+                    f"\n{len(key_to_i)} segments disponibles, p. ex. : "
+                    + ", ".join(sorted(key_to_i)[:3])
+                )
+            i = key_to_i[key]
+            if pos == "first":
+                model.Add(x[i][0] == 1)
+            elif pos == "last":
+                if is_last_pin is None:
+                    is_last_pin = _last_used_position(model, used, n_pos)
+                for p in range(n_pos):
+                    model.Add(x[i][p] == is_last_pin[p])
+            else:
+                if not (0 <= pos < n_pos):
+                    raise ValueError(
+                        f"pin {key}=@{pos} hors bornes : au plus {n_pos} "
+                        f"positions possibles pour cette durée cible (0..{n_pos - 1})"
+                    )
+                if pos in seen_positions:
+                    raise ValueError(
+                        f"deux plans pinnés à la position {pos} : "
+                        f"{seen_positions[pos]} et {key}"
+                    )
+                seen_positions[pos] = key
+                model.Add(x[i][pos] == 1)
 
     denom = max(1, n_pos - 1)
     coeff = [
