@@ -25,9 +25,10 @@ V = {
     "probe": "1",
     "scenes": "1",
     "thumbs": "1",
-    "annot": "2",  # 2 = alignement strict + échec explicite
-    "segments": "2",
-    "candidates": "2",  # 2 = exclusion par clé, plus par filtrage de liste
+    "annot": "3",  # 3 = le modèle ne juge plus netteté ni exposition
+    "metrics": "2",  # 2 = mouvement caméra par RANSAC, stabilité optionnelle
+    "segments": "3",  # 3 = fusion des métriques locales
+    "candidates": "3",  # 3 = terme technique dans l'objectif  # 2 = exclusion par clé, plus par filtrage de liste
     "ranked": "3",  # 3 = mode manuel + source_key dans le plan
     "alternates": "1",
     "render": "1",
@@ -76,6 +77,18 @@ def _annot(rush: str, scenes: list[list[float]], thumbs: list[str], model: str) 
     return [x.model_dump(mode="json") for x in sem]
 
 
+def _metrics(rush: str, scenes: list[list[float]], n_samples: int) -> list[dict]:
+    """Mesures locales, en pleine résolution. Aucun réseau, aucun modèle.
+
+    Nœud frère de `annot` et non successeur : les deux ne dépendent que de
+    `scenes`, donc ils sont indépendants et parallélisables.
+    """
+    from src.video.metrics import measure_scenes
+
+    out = measure_scenes(rush, [(s, e) for s, e in scenes], n_samples=n_samples)
+    return [m.model_dump(mode="json") for m in out]
+
+
 def _segments(n_rushes: int, drop_failed: bool, **arts: Any) -> dict:
     """Fusionne les nœuds par rush en un `AnalysisResult`.
 
@@ -97,10 +110,23 @@ def _segments(n_rushes: int, drop_failed: bool, **arts: Any) -> dict:
         annots = arts[f"annot_{i}"]
         total += float(arts[f"probe_{i}"]["duration"])
 
+        mets = arts.get(f"metrics_{i}") or [None] * len(scenes)
+
         for j, ((s, e), thumb, a) in enumerate(zip(scenes, thumbs, annots)):
             if drop_failed and a.get("failed"):
                 dropped += 1
                 continue
+            m = mets[j] if j < len(mets) else None
+            if m is not None and m.get("failed"):
+                m = None  # mesure ratée : on n'invente pas une note technique
+            if m:
+                known = [
+                    m[k] for k in ("sharpness", "exposure", "stability")
+                    if m.get(k) is not None
+                ]
+                tech = min(known) if known else None
+            else:
+                tech = None
             segments.append(
                 VideoSegment(
                     source_file=rush,
@@ -112,6 +138,11 @@ def _segments(n_rushes: int, drop_failed: bool, **arts: Any) -> dict:
                     emotion=str(a["emotion"]),
                     suggested_role=str(a["suggested_role"]),
                     thumbnail_path=thumb,
+                    technical_score=tech,
+                    sharpness=m["sharpness"] if m else None,
+                    exposure=m["exposure"] if m else None,
+                    stability=m.get("stability") if m else None,
+                    motion=m.get("motion") if m else None,
                 )
             )
 
@@ -284,6 +315,7 @@ def build(
     max_segments_per_rush: int = 40,
     min_scene_duration: float = 0.6,
     thumbnail_offset: float = 0.3,
+    metric_samples: int = 3,
     k_per_preset: int = 2,
     solver_time_limit_s: float = 15.0,
     banned_segments: Sequence[str] = (),
@@ -323,6 +355,14 @@ def build(
             codec="path_list",
             label=Path(path).name,
         )
+        metrics = Node(
+            "metrics",
+            _metrics,
+            {"rush": src, "scenes": scenes},
+            params={"n_samples": metric_samples},
+            version=V["metrics"],
+            label=Path(path).name,
+        )
         annot = Node(
             "annot",
             _annot,
@@ -337,6 +377,7 @@ def build(
             f"scenes_{i}": scenes,
             f"thumbs_{i}": thumbs,
             f"annot_{i}": annot,
+            f"metrics_{i}": metrics,
         }
 
     segments = Node(

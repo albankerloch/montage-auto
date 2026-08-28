@@ -246,6 +246,8 @@ contraintes, et que la boucle de révision était une recherche dégradée
 | Évaluation | score absolu 0–1 contre un seuil de 0.70 | comparaison par paires, sans calibration |
 | Sortie | un montage | un classement : livré + alternates |
 | Humain | absent, simulé par le CRITIC | veto, choix, arbitrage sans modèle |
+| Netteté, expo, stabilité | devinées par le modèle sur 640 px | mesurées en pleine résolution |
+| Évaluation | le CRITIC se note lui-même | taux d'accord avec le montage livré |
 | Reprise | aucune | propriété du cache |
 | Rejouabilité | non | oui (solveur déterministe) |
 
@@ -314,6 +316,55 @@ dernière image avant chaque coupe et la première après. L'ancien CRITIC recev
 trois keyframes à 10/50/90 % du rendu — il ne voyait donc jamais une seule
 coupe, et jugeait le contenu en croyant juger le montage.
 
+### Les mesures locales (`src/video/metrics.py`)
+
+Le modèle ne juge plus la mise au point ni l'exposition. La vignette qu'on lui
+envoie fait 640 px de large en JPEG : à cette échelle, un rush 4K légèrement
+flou et un rush net sont identiques, et un demi-stop d'écrêtage a disparu dans
+la recompression. On lui posait une question dont l'information n'était plus
+dans l'image.
+
+Un nœud `metrics`, frère de `annot` et indépendant de lui, mesure trois choses
+sur les pixels d'origine, en trois points par plan :
+
+| Mesure | Comment | Piège évité |
+|---|---|---|
+| Netteté | rapport entre l'énergie haute fréquence de l'image et celle de sa version floutée | la variance brute du Laplacien classe la *texture* : un mur de briques net bat un ciel net |
+| Exposition | pixels collés aux extrémités de l'histogramme, hautes lumières pondérées plus fort que les noirs | les noirs bouchés sont souvent intentionnels et se rattrapent |
+| Stabilité | transformation dominante entre images consécutives, estimée par RANSAC sur points suivis | la corrélation de phase mesure le mouvement *apparent* : une caméra posée devant une piste de danse en ressortait « instable » |
+
+`technical` est le **minimum** des trois, pas la moyenne : un plan cramé mais
+net et stable, un monteur le jette. Et une mesure impossible vaut `None`, jamais
+1.0 — le suivi de points échoue d'abord sur les plans très secoués, donc une
+valeur neutre par défaut donnerait la meilleure note aux pires plans.
+
+L'objectif CP-SAT porte désormais deux termes distincts, `quality_weight`
+(intérêt jugé par le modèle) et `technical_weight` (défauts mesurés) : un plan
+peut être narrativement indispensable et techniquement médiocre, c'est au preset
+d'arbitrer et non au modèle de moyenner les deux à l'aveugle.
+
+Les seuils (`_SHARP_FLOOR`, `_CLIP_TOLERANCE`, `_JITTER_TOLERANCE`) sont calés
+sur mires de synthèse. Ils demandent à être revus sur de vrais rushes, optique
+et grain compris.
+
+### Le retour depuis le NLE (`src/conform.py`)
+
+```bash
+python -m src.conform output/01_punchy_plan.json monté.fcpxml --write-bans bans.json
+python -m src.main rushes/ --ban-file bans.json
+```
+
+On relit la timeline conformée et on la compare au plan proposé. L'appariement
+se fait par recouvrement et non par égalité : un monteur rogne presque toujours,
+et compter un plan raccourci comme « écarté puis ajouté » fausserait le résultat
+dans les deux sens.
+
+En sortie : les plans écartés deviennent des clés de veto, les plans ajoutés des
+candidats à imposer, et surtout un **taux d'accord**. C'est le premier signal
+d'évaluation du dépôt qui ne soit pas l'avis d'un modèle sur son propre travail,
+et le seul moyen que `quality_weight`, `technical_weight` et les tables d'énergie
+cessent d'être des nombres choisis au jugé.
+
 ### La boucle humaine
 
 Le solveur propose, le monteur dispose — et son avis rentre dans le graphe au
@@ -351,7 +402,7 @@ endroit où un modèle jouait encore le rôle de l'humain.
 pip install pytest && python -m pytest tests -q
 ```
 
-39 tests, sans clé API. Les tests de bout en bout utilisent des doubles
+54 tests, sans clé API. Les tests de bout en bout utilisent des doubles
 déterministes pour les deux agents LLM et des fixtures vidéo générées par
 ffmpeg ; ils se skippent si `tests/fixtures/rushes/` est vide.
 

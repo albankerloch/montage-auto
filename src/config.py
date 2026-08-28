@@ -27,6 +27,7 @@ THUMBNAIL_TIME_OFFSET = 0.3   # fraction into segment for thumbnail
 # ── Moteur graphe + solveur + faisceau (src/pipeline.py) ────────────────────
 CACHE_DIR = BASE_DIR / "output" / "cache"
 ANNOTATE_BATCH_SIZE = 4       # images par appel vision
+METRIC_SAMPLES = 3            # points de mesure locale par plan (pleine résolution)
 K_PER_PRESET = 2              # solutions distinctes demandées au solveur par intention
 SOLVER_TIME_LIMIT_S = 15.0
 DEDUPE_THRESHOLD = 0.85       # Jaccard au-delà duquel deux candidats sont redondants

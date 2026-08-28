@@ -81,7 +81,8 @@ class Preset(BaseModel):
     max_shot: float = 6.0
     target_shot: float = 3.0
 
-    quality_weight: float = 1.0
+    quality_weight: float = 1.0     # intérêt jugé par le modèle
+    technical_weight: float = 1.0   # défauts mesurés localement
     role_weight: float = 0.6
     energy_weight: float = 0.6
     pacing_weight: float = 0.4
@@ -146,6 +147,7 @@ PRESETS: dict[str, Preset] = {
         name="best_of",
         curve="flat",
         quality_weight=2.0,
+        technical_weight=2.0,
         role_weight=0.0,
         energy_weight=0.0,
         pacing_weight=0.2,
@@ -205,6 +207,11 @@ def _segment_score(seg: VideoSegment, use_dur: float, pos: float, preset: Preset
     want = energy_curve(preset.curve, pos)
 
     s = preset.quality_weight * seg.quality_score
+    if seg.technical_score is not None:
+        # Terme séparé, et non fondu dans une note unique : un plan peut être
+        # narrativement indispensable et techniquement médiocre. C'est au
+        # preset d'arbitrer, pas au modèle de moyenner les deux à l'aveugle.
+        s += preset.technical_weight * seg.technical_score
     s += preset.role_weight * (1.0 - abs(role - pos))
     s += preset.energy_weight * (1.0 - abs(energy - want))
     s -= preset.pacing_weight * min(
@@ -448,7 +455,14 @@ def explain(candidate: Candidate, segments: Sequence[VideoSegment], preset: Pres
         lines.append(
             f"  {p:>2}. {segment_key(s.source_file, s.start_time):<24} "
             f"[{pick.start:.2f}→{pick.end:.2f}] ({pick.end - pick.start:.1f}s) "
-            f"q={s.quality_score:.2f} {s.suggested_role}/{s.emotion} "
+            f"i={s.quality_score:.2f}"
+            + (
+                f" t={s.technical_score:.2f}"
+                f"(n{s.sharpness:.2f}/e{s.exposure:.2f}/"
+                + (f"s{s.stability:.2f})" if s.stability is not None else "s—)")
+                if s.technical_score is not None else " t=—"
+            )
+            + f" {s.suggested_role}/{s.emotion} "
             f"| énergie visée {energy_curve(preset.curve, pos):.2f} "
             f"| score {_segment_score(s, pick.end - pick.start, pos, preset):.3f}"
         )

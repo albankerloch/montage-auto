@@ -33,7 +33,19 @@ class VideoSegment(BaseModel):
     start_time: float
     end_time: float
     duration: float
-    quality_score: float = Field(ge=0.0, le=1.0, description="Technical/aesthetic quality")
+    quality_score: float = Field(
+        ge=0.0, le=1.0,
+        description="Intérêt du plan jugé par le modèle : cadre, sujet, valeur narrative. "
+                    "Ne porte plus sur la mise au point ni l'exposition, qui se mesurent.",
+    )
+    technical_score: float | None = Field(
+        default=None,
+        description="Pire défaut technique mesuré localement (min des trois ci-dessous)",
+    )
+    sharpness: float | None = None
+    exposure: float | None = None
+    stability: float | None = None
+    motion: float | None = Field(default=None, description="Déplacement global, px/image")
     semantic_tags: list[str] = Field(description="e.g. action, dialogue, establishing_shot")
     emotion: str = Field(description="Dominant emotion: energetic, calm, tense, joyful, etc.")
     suggested_role: str = Field(description="opening, build_up, climax, resolution, outro, b_roll")

@@ -29,7 +29,10 @@ SYSTEM_PROMPT = """You are an expert video editor and cinematographer analyzing 
 
 For each numbered frame, return one analysis, in the same order, with the same count.
 
-1. quality_score (0.0-1.0): focus, exposure, composition, framing
+1. quality_score (0.0-1.0): how INTERESTING this shot is — framing, composition,
+   subject, narrative value. Do NOT judge focus, exposure or camera shake: those
+   are measured on the full-resolution source, and the 640px preview you are
+   shown cannot answer them.
 2. semantic_tags: what is happening
 3. emotion: dominant emotion
 4. suggested_role: narrative role in an edit
