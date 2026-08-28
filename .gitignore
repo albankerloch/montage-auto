@@ -207,3 +207,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Cache du moteur graphe
+output/cache/
+tests/fixtures/rushes/*.mp4

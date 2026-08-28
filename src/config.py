@@ -11,6 +11,7 @@ SCENARIO_MODEL = "claude-sonnet-4-6"            # needs reasoning
 CRITIC_MODEL = "claude-sonnet-4-6"              # needs reasoning
 REVISION_MODEL = "claude-haiku-4-5-20251001"    # translation, not creation
 QUALITY_MODEL = "claude-haiku-4-5-20251001"     # simple gate
+COMPARATOR_MODEL = "claude-sonnet-4-6"          # comparaison par paires (moteur graphe)
 
 # Paths
 BASE_DIR = Path(__file__).parent.parent
@@ -20,10 +21,20 @@ RUSHES_DIR = BASE_DIR / "rushes"
 
 # Video settings
 TARGET_MONTAGE_DURATION = 60  # seconds, default target
-MAX_SEGMENTS_PER_RUSH = 10
-THUMBNAIL_TIME_OFFSET = 0.1   # fraction into segment for thumbnail
+MAX_SEGMENTS_PER_RUSH = 40    # échantillonné uniformément, plus tronqué aux N premières
+THUMBNAIL_TIME_OFFSET = 0.3   # fraction into segment for thumbnail
+
+# ── Moteur graphe + solveur + faisceau (src/pipeline.py) ────────────────────
+CACHE_DIR = BASE_DIR / "output" / "cache"
+ANNOTATE_BATCH_SIZE = 4       # images par appel vision
+K_PER_PRESET = 2              # solutions distinctes demandées au solveur par intention
+SOLVER_TIME_LIMIT_S = 15.0
+DEDUPE_THRESHOLD = 0.85       # Jaccard au-delà duquel deux candidats sont redondants
+MAX_CANDIDATES = 6            # plafond de candidats soumis au classement LLM
+COMPARATOR_MAX_CUTS = 4       # raccords montrés par candidat
 
 # Ensure output dirs exist
 OUTPUT_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 THUMBNAILS_DIR.mkdir(exist_ok=True)
 RUSHES_DIR.mkdir(exist_ok=True)

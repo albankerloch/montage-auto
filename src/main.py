@@ -7,7 +7,55 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from src.assemble import DEFAULT_BEAM, PRESETS
+from src.config import TARGET_MONTAGE_DURATION
+
 load_dotenv()
+
+
+def _run_graph(args, rush_paths) -> int:
+    """Moteur graphe : aucune boucle, sortie classée."""
+    from src.pipeline import Run, run as run_pipeline
+
+    preset_names = [p.strip() for p in args.presets.split(",") if p.strip()]
+    unknown = [p for p in preset_names if p not in PRESETS]
+    if unknown:
+        print(f"Error: preset(s) inconnu(s): {', '.join(unknown)}")
+        print(f"Disponibles: {', '.join(PRESETS)}")
+        return 1
+
+    if args.explain:
+        r = Run(rush_paths, preset_names=preset_names, target_duration=args.duration, verbose=False)
+        print(r.plan("ranked"))
+        todo = r.todo("ranked")
+        print(f"\n{len(todo)} nœud(s) à recalculer :")
+        for n in todo:
+            print(f"  • {n.name}:{n.key()[:8]}" + (f" [{n.label}]" if n.label else ""))
+        print("\n(✓ = déjà en cache, • = à calculer)")
+        return 0
+
+    r = run_pipeline(
+        rush_paths,
+        preset_names,
+        render=not args.no_render,
+        export=True,
+        target_duration=args.duration,
+    )
+
+    if args.resolve:
+        from src.export_resolve import build_timeline_in_resolve
+        from src.models import EditPlan
+
+        plan = EditPlan.model_validate(r.get("ranked")["plans"][0])
+        print("\nBuilding timeline in DaVinci Resolve…")
+        try:
+            build_timeline_in_resolve(plan)
+        except SystemExit as e:
+            print(f"Resolve build skipped: {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Resolve build failed: {e}")
+
+    return 0
 
 
 def main():
@@ -19,12 +67,50 @@ Examples:
   python -m src.main rushes/clip1.mp4 rushes/clip2.mp4
   python -m src.main rushes/*.mp4 --max-iter 2
   python -m src.main rushes/ --output output/my_montage.mp4
+
+  # moteur graphe + solveur + faisceau (défaut)
+  python -m src.main rushes/ --engine graph
+  python -m src.main rushes/ --engine graph --presets punchy,emotional_arc --duration 90
+  python -m src.main rushes/ --engine graph --explain      # que recalculerait-on ?
+
+  # ancienne machine à états avec boucle de révision
+  python -m src.main rushes/ --engine loop --max-iter 3
         """,
     )
     parser.add_argument(
         "inputs",
         nargs="+",
         help="Video files or a directory containing video files",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("graph", "loop"),
+        default="graph",
+        help="graph = graphe de dépendances + CP-SAT + faisceau classé (défaut) ; "
+             "loop = machine à états historique avec boucle CRITIC→REVISION",
+    )
+    parser.add_argument(
+        "--presets",
+        type=str,
+        default=",".join(DEFAULT_BEAM),
+        help=f"Intentions du faisceau, séparées par des virgules. Disponibles : "
+             f"{', '.join(PRESETS)}",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=TARGET_MONTAGE_DURATION,
+        help="Durée cible du montage en secondes (moteur graph)",
+    )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Produire plan et exports NLE sans rendre le mp4 (moteur graph)",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Afficher le graphe et les nœuds à recalculer, puis sortir",
     )
     parser.add_argument(
         "--max-iter",
@@ -75,6 +161,9 @@ Examples:
     for p in rush_paths:
         print(f"  • {p}")
     print()
+
+    if args.engine == "graph":
+        return _run_graph(args, rush_paths)
 
     from src.orchestrator import Orchestrator
 

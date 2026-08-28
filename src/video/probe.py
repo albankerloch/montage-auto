@@ -1,6 +1,7 @@
 """Video metadata extraction and scene detection using embedded ffmpeg."""
 from __future__ import annotations
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,48 +13,76 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _ffprobe_cmd(file_path: str) -> list[str]:
-    """
-    Build a probe command that works whether we have ffprobe or just ffmpeg.
-    ffprobe and ffmpeg share the same binary family; ffmpeg exposes probe-style
-    output via the same -show_streams / -print_format flags when invoked as ffprobe.
-    imageio-ffmpeg ships only ffmpeg, so we use it with -hide_banner instead.
+def _ffprobe_cmd(file_path: str) -> list[str] | None:
+    """Commande ffprobe si un ffprobe est réellement disponible, sinon None.
+
+    ATTENTION : la version précédente prétendait que « ffmpeg expose la sortie
+    de type probe via les mêmes flags -show_streams / -print_format ». C'est
+    faux — ffmpeg répond `Unrecognized option 'print_format'`. Or imageio-ffmpeg
+    n'embarque QUE ffmpeg (c'est tout l'argument du « pas besoin d'installer
+    ffmpeg »), donc sur une installation propre cette branche échouait toujours
+    et chaque probe retombait en silence sur moviepy, qui ouvre un
+    VideoFileClip complet juste pour lire une durée. On préfère désormais les
+    métadonnées d'imageio-ffmpeg, qui ne demandent aucun ffprobe.
     """
     ffmpeg = _ffmpeg_exe()
-    # Try ffprobe next to ffmpeg first
-    ffprobe = Path(ffmpeg).parent / "ffprobe.exe"
-    if not ffprobe.exists():
-        ffprobe = Path(ffmpeg).parent / "ffprobe"
-    if ffprobe.exists():
-        return [str(ffprobe), "-v", "quiet", "-print_format", "json",
-                "-show_streams", "-show_format", file_path]
-    # Fallback: use ffmpeg's built-in probe capability
-    # ffmpeg supports -hide_banner -v quiet -print_format json -show_streams
-    # via the same libavformat infrastructure
-    return [ffmpeg, "-hide_banner", "-v", "quiet", "-print_format", "json",
-            "-show_streams", "-show_format", file_path]
+    for candidate in (
+        Path(ffmpeg).parent / "ffprobe.exe",
+        Path(ffmpeg).parent / "ffprobe",
+        Path(shutil.which("ffprobe") or "/nonexistent"),
+    ):
+        if candidate.exists():
+            return [
+                str(candidate), "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-show_format", file_path,
+            ]
+    return None
+
+
+def _probe_with_imageio(file_path: str) -> VideoMetadata:
+    """Métadonnées via imageio-ffmpeg : pas de ffprobe, pas de moviepy."""
+    import imageio_ffmpeg
+
+    reader = imageio_ffmpeg.read_frames(file_path)
+    try:
+        meta = next(reader)
+    finally:
+        reader.close()
+
+    width, height = meta.get("size", (0, 0))
+    return VideoMetadata(
+        file_path=file_path,
+        duration=float(meta.get("duration", 0.0) or 0.0),
+        fps=float(meta.get("fps", 25.0) or 25.0),
+        width=int(width),
+        height=int(height),
+        has_audio=meta.get("audio_codec") is not None,
+        codec=str(meta.get("codec", "unknown")),
+        file_size_bytes=Path(file_path).stat().st_size,
+    )
 
 
 def probe_video(file_path: str) -> VideoMetadata:
     """Extract technical metadata from a video file."""
     cmd = _ffprobe_cmd(file_path)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if cmd is None:
+        return _probe_with_imageio(file_path)
 
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0 or not result.stdout.strip():
-        # Final fallback: use moviepy to get basic info
-        return _probe_with_moviepy(file_path)
+        return _probe_with_imageio(file_path)
 
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return _probe_with_moviepy(file_path)
+        return _probe_with_imageio(file_path)
 
     video_stream = next((s for s in data.get("streams", []) if s["codec_type"] == "video"), None)
     audio_stream = next((s for s in data.get("streams", []) if s["codec_type"] == "audio"), None)
     fmt = data.get("format", {})
 
     if not video_stream:
-        return _probe_with_moviepy(file_path)
+        return _probe_with_imageio(file_path)
 
     fps_raw = video_stream.get("r_frame_rate", "25/1")
     num, den = fps_raw.split("/")
@@ -75,7 +104,7 @@ def probe_video(file_path: str) -> VideoMetadata:
 
 
 def _probe_with_moviepy(file_path: str) -> VideoMetadata:
-    """Fallback: extract metadata using moviepy (which uses embedded ffmpeg)."""
+    """Dernier recours historique. Conservé, mais plus sur le chemin nominal."""
     import os
     os.environ.setdefault("IMAGEIO_FFMPEG_EXE", _ffmpeg_exe())
     from moviepy import VideoFileClip

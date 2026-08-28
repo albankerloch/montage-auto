@@ -1,0 +1,3046 @@
+From 29bae1f42d3ea0ed84feda2c051358bb1b10269a Mon Sep 17 00:00:00 2001
+From: Alban <alban@local>
+Date: Fri, 28 Aug 2026 07:24:50 +0000
+Subject: [PATCH] =?UTF-8?q?Remplace=20la=20boucle=20de=20r=C3=A9vision=20p?=
+ =?UTF-8?q?ar=20graphe=20+=20solveur=20+=20faisceau?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+La machine à états de `orchestrator.py` était une recherche dégradée : faisceau
+de 1, récompense scalaire produite par un LLM, aucune garantie de monotonie, et
+un seul artefact en sortie là où la cible annoncée était un stringout riche avec
+des alternates classés. Ce commit remplace les trois couches.
+
+B — Graphe de dépendances (src/graph.py, src/nodes.py)
+  Aucun ordre d'exécution n'est écrit : on déclare qui dépend de quoi. Chaque
+  nœud porte sha256(nom + version + params + clés des dépendances) et
+  `materialize` ne calcule que ce qui manque. La reprise après crash devient une
+  propriété du cache ; ajouter un rush ne réanalyse que ce rush ; changer la
+  durée cible n'invalide pas les annotations vision, qui sont le poste de coût.
+  Le corps des fonctions n'est pas haché — `V[...]` déclare les changements de
+  sémantique, comme une migration.
+
+A — Assemblage par CP-SAT (src/assemble.py)
+  Le LLM annote, le solveur sélectionne et ordonne. x[i][p] = 1 si le segment i
+  occupe la position p. Contraintes dures : bande de durée, unicité, positions
+  contiguës, pas deux plans adjacents du même rush, ouverture en tête,
+  résolution en queue, chronologie optionnelle. Objectif : qualité, adéquation
+  rôle/position, écart à une courbe d'énergie, écart au rythme, moins un péage
+  par plan. Il n'y a plus rien à réviser : l'optimum sous contraintes est atteint
+  en un passage, et le solveur énumère K solutions distinctes.
+
+C — Faisceau et classement par paires (src/beam.py, src/agents/comparator.py)
+  Cinq intentions sont des Preset et non des prompts : générer le faisceau coûte
+  zéro token et les solveurs sont indépendants. Le classement remplace le score
+  absolu contre un seuil de 0.70 par une comparaison par paires, qui n'exige
+  aucune calibration. Le comparateur reçoit les frames de raccord — l'ancien
+  CRITIC recevait trois keyframes à 10/50/90 % et ne voyait donc jamais une
+  seule coupe.
+
+Corrections de bugs trouvées en écrivant les tests :
+
+  - src/video/probe.py : `_ffprobe_cmd` prétendait que ffmpeg accepte
+    -show_streams / -print_format. Il répond « Unrecognized option ». Comme
+    imageio-ffmpeg n'embarque que ffmpeg, cette branche échouait toujours et
+    chaque probe retombait en silence sur moviepy, qui ouvre un VideoFileClip
+    complet pour lire une durée. Bascule sur les métadonnées imageio-ffmpeg.
+
+  - src/agents/analyzer.py : l'appariement analyses/segments par
+    `segment_index == i + 1` avec repli positionnel décalait tous les segments
+    suivants si un batch renvoyait moins d'analyses que d'images — note et
+    émotion attribuées au mauvais plan, silencieusement. Garde d'alignement ici,
+    reprise unitaire du batch dans src/agents/annotator.py.
+
+  - src/agents/annotator.py : l'échec d'annotation est porté par le contrat
+    (`failed=True`) au lieu d'être maquillé en quality_score=0.5 / neutral,
+    indiscernable en aval d'une vraie analyse.
+
+  - src/nodes.py : l'échantillonnage des scènes est uniforme sur la durée.
+    `scenes[:MAX_SEGMENTS_PER_RUSH]` gardait les N premières : sur un mariage de
+    40 minutes, le système ne voyait jamais la fin.
+
+  - src/config.py : MAX_SEGMENTS_PER_RUSH 10 → 40, THUMBNAIL_TIME_OFFSET remis
+    en service (il valait 0.1 en config et 0.3 en dur dans le code).
+
+Le solveur tourne sur un worker avec une limite en temps déterministe. Ce n'est
+pas un confort : un cache adressé par contenu devient menteur si une fonction
+n'est pas reproductible. Effet secondaire, `punchy` atteint l'optimum en 5 s là
+où huit workers plafonnaient à FEASIBLE en 15 s.
+
+L'ancien moteur reste accessible sous `--engine loop`.
+
+31 tests, sans clé API. Les tests de bout en bout emploient des doubles
+déterministes pour les deux agents LLM et des fixtures ffmpeg (non versionnées,
+script de régénération dans tests/fixtures/README.md).
+---
+ .gitignore                 |   4 +
+ README.md                  | 107 ++++++++-
+ requirements.txt           |   1 +
+ src/agents/analyzer.py     |  22 +-
+ src/agents/annotator.py    | 174 +++++++++++++++
+ src/agents/comparator.py   | 117 ++++++++++
+ src/assemble.py            | 446 +++++++++++++++++++++++++++++++++++++
+ src/beam.py                | 161 +++++++++++++
+ src/config.py              |  15 +-
+ src/graph.py               | 238 ++++++++++++++++++++
+ src/main.py                |  89 ++++++++
+ src/nodes.py               | 353 +++++++++++++++++++++++++++++
+ src/pipeline.py            | 193 ++++++++++++++++
+ src/video/cuts.py          |  81 +++++++
+ src/video/probe.py         |  77 +++++--
+ tests/fixtures/README.md   |  31 +++
+ tests/test_assemble.py     | 155 +++++++++++++
+ tests/test_beam.py         |  98 ++++++++
+ tests/test_graph.py        | 132 +++++++++++
+ tests/test_pipeline_e2e.py | 211 ++++++++++++++++++
+ 20 files changed, 2667 insertions(+), 38 deletions(-)
+ create mode 100644 src/agents/annotator.py
+ create mode 100644 src/agents/comparator.py
+ create mode 100644 src/assemble.py
+ create mode 100644 src/beam.py
+ create mode 100644 src/graph.py
+ create mode 100644 src/nodes.py
+ create mode 100644 src/pipeline.py
+ create mode 100644 src/video/cuts.py
+ create mode 100644 tests/fixtures/README.md
+ create mode 100644 tests/test_assemble.py
+ create mode 100644 tests/test_beam.py
+ create mode 100644 tests/test_graph.py
+ create mode 100644 tests/test_pipeline_e2e.py
+
+diff --git a/.gitignore b/.gitignore
+index e4fe76b..881681a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -207,3 +207,7 @@ cython_debug/
+ marimo/_static/
+ marimo/_lsp/
+ __marimo__/
++
++# Cache du moteur graphe
++output/cache/
++tests/fixtures/rushes/*.mp4
+diff --git a/README.md b/README.md
+index 1888ccb..90fc97c 100644
+--- a/README.md
++++ b/README.md
+@@ -230,9 +230,112 @@ Les paramètres principaux sont dans `src/config.py` :
+ 
+ ---
+ 
++## Deux moteurs
++
++Le dépôt embarque deux implémentations du même problème. La première est
++l'originale ; la seconde est ce vers quoi elle a convergé une fois admis que
++l'essentiel de ce qu'on demandait au LLM était un problème d'optimisation sous
++contraintes, et que la boucle de révision était une recherche dégradée
++(faisceau de 1, récompense scalaire bruitée, aucune garantie de monotonie).
++
++| | `--engine loop` (historique) | `--engine graph` (défaut) |
++|---|---|---|
++| Ordonnancement | machine à états écrite à la main | graphe de dépendances, remonté à la demande |
++| Assemblage | SCENARIO (LLM) écrit la timeline | CP-SAT sous contraintes déclarées |
++| Exploration | boucle CRITIC → REVISION, séquentielle | faisceau de N intentions, indépendantes |
++| Évaluation | score absolu 0–1 contre un seuil de 0.70 | comparaison par paires, sans calibration |
++| Sortie | un montage | un classement : livré + alternates |
++| Reprise | aucune | propriété du cache |
++| Rejouabilité | non | oui (solveur déterministe) |
++
++```bash
++python -m src.main rushes/ --engine graph
++python -m src.main rushes/ --engine graph --presets punchy,emotional_arc --duration 90
++python -m src.main rushes/ --engine graph --explain   # que recalculerait-on ?
++python -m src.main rushes/ --engine loop --max-iter 3 # ancien comportement
++```
++
++### Le graphe (`src/graph.py`, `src/nodes.py`)
++
++On ne décrit aucun ordre d'exécution, seulement qui dépend de quoi. Chaque nœud
++porte une clé `sha256(nom + version + params + clés des dépendances)` ; demander
++un artefact matérialise ce qui manque.
++
++```
++rush ─┬─ probe ──────────────┐
++      ├─ scenes ─┬─ thumbs ──┼─ annot ─┐
++      └──────────┘           │         │
++                             └─────────┴─ segments ─ candidates ─ ranked ─┬─ render
++                                                                          └─ exports
++```
++
++Les nœuds par rush sont indépendants entre rushes. Conséquences vérifiées par
++`tests/test_pipeline_e2e.py` :
++
++- ajouter un rush ne réanalyse que ce rush ;
++- passer la durée cible de 60 à 90 s n'invalide que `candidates` et l'aval —
++  jamais les annotations vision, qui sont le poste de coût ;
++- un plantage en aval ne perd pas le travail amont ;
++- `--explain` affiche le graphe et ce qui serait recalculé.
++
++Le corps des fonctions n'est **pas** haché : c'est `V[...]` dans `src/nodes.py`
++qui déclare qu'un calcul a changé de sémantique, comme une migration. Et le
++cache impose le déterminisme : un nœud non déterministe rend la valeur relue
++différente d'un recalcul, ce qui est la raison pour laquelle le solveur tourne
++sur un worker avec une limite en temps déterministe.
++
++### Le solveur (`src/assemble.py`)
++
++Le LLM annote (`quality_score`, rôle, émotion). Le solveur sélectionne et
++ordonne : `x[i][p] = 1` si le segment `i` occupe la position `p`.
++
++Contraintes dures : durée dans la bande de tolérance, chaque segment au plus une
++fois, positions contiguës, pas deux plans adjacents du même rush, plan
++d'ouverture en tête, résolution en queue, ordre chronologique optionnel.
++Objectif : qualité, adéquation rôle/position, écart à une courbe d'énergie,
++écart au rythme cible, moins un péage par plan (sans lui, une somme de scores
++positifs veut toujours plus de plans et sature le plafond de durée).
++
++Chaque contrainte est testable et se discute avec un monteur, contrairement à un
++prompt de 400 mots. `Candidate.gap` expose l'écart à la borne supérieure : on
++sait ce qu'on ne sait pas.
++
++### Le faisceau (`src/beam.py`)
++
++Cinq intentions — `chronological`, `emotional_arc`, `punchy`, `contemplative`,
++`best_of` — sont des `Preset`, pas des prompts : générer le faisceau coûte zéro
++token et les solveurs sont indépendants. Le solveur énumère K solutions
++distinctes par intention (no-good de diversité), on déduplique au Jaccard, puis
++on classe par comparaison par paires.
++
++Le comparateur reçoit les **frames de raccord** (`src/video/cuts.py`) : la
++dernière image avant chaque coupe et la première après. L'ancien CRITIC recevait
++trois keyframes à 10/50/90 % du rendu — il ne voyait donc jamais une seule
++coupe, et jugeait le contenu en croyant juger le montage.
++
++## Tests
++
++```bash
++pip install pytest && python -m pytest tests -q
++```
++
++31 tests, sans clé API. Les tests de bout en bout utilisent des doubles
++déterministes pour les deux agents LLM et des fixtures vidéo générées par
++ffmpeg ; ils se skippent si `tests/fixtures/rushes/` est vide.
++
++---
++
+ ## Limites (POC)
+ 
+-- Le CRITIC évalue le **plan** et des **keyframes** statiques, pas la vidéo en temps réel
++- Le comparateur juge des images fixes de raccord, pas le mouvement : un faux
++  raccord sur un travelling lui échappe encore
++- Aucune notion de multicam (synchro, choix d'angle sur action simultanée)
++- Le coût et la latence ne sont pas instrumentés : `response.usage` n'est lu
++  nulle part, donc aucun chiffre de bout en bout n'est disponible
+ - Les rushes très longs (>10 min) peuvent ralentir l'analyse — ajuster `MAX_SEGMENTS_PER_RUSH`
+-- Pas de gestion de la musique (le SCENARIO suggère un titre, sans l'intégrer)
++- **Pas d'audio du tout** : `has_audio` est relevé et jamais lu. C'est le manque
++  le plus visible pour un monteur, le rythme d'un montage étant piloté par la
++  parole et la musique. La suite naturelle est d'en faire des contraintes du
++  solveur (« chaque coupe à ±80 ms d'un onset »), ce qu'un prompt ne sait pas
++  garantir et qu'un modèle CP-SAT garantit par construction
+ - La détection de scènes est basée sur les I-frames ffmpeg, pas sur un modèle de vision dédié
+diff --git a/requirements.txt b/requirements.txt
+index 58b3b30..15e0f2c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -6,3 +6,4 @@ pydantic>=2.0.0
+ python-dotenv>=1.0.0
+ pillow>=10.0.0
+ numpy>=1.24.0
++ortools>=9.8
+diff --git a/src/agents/analyzer.py b/src/agents/analyzer.py
+index bc676ac..3be7cbb 100644
+--- a/src/agents/analyzer.py
++++ b/src/agents/analyzer.py
+@@ -5,6 +5,7 @@ from pydantic import BaseModel
+ 
+ from src.agents.base_agent import BaseAgent
+ from src.config import ANALYZER_MODEL, MAX_SEGMENTS_PER_RUSH, TARGET_MONTAGE_DURATION
++from src.agents.annotator import SegmentSemantics  # contrat partagé avec le moteur graphe
+ from src.models import AnalysisResult, VideoSegment
+ from src.video.probe import probe_video, detect_scenes
+ from src.video.thumbnails import extract_thumbnail, build_vision_content
+@@ -23,16 +24,6 @@ Be critical and honest. Prioritize high-quality, visually interesting segments.
+ Return your analysis for ALL segments shown."""
+ 
+ 
+-class SegmentSemantics(BaseModel):
+-    segment_index: int
+-    quality_score: float
+-    semantic_tags: list[str]
+-    emotion: str
+-    suggested_role: str
+-    include_recommendation: bool
+-    notes: str
+-
+-
+ class SemanticAnalysisResult(BaseModel):
+     segments: list[SegmentSemantics]
+     overall_summary: str
+@@ -110,6 +101,17 @@ class AnalyzerAgent(BaseAgent):
+             all_semantics.extend(batch_semantics)
+             overall_summaries.append(f"Batch {batch_start // _BATCH_SIZE + 1}: {len(batch)} segments analyzed")
+ 
++        # Garde d'alignement. Sans elle, un batch qui renvoie moins d'analyses
++        # que d'images décale TOUS les segments suivants : la note et l'émotion
++        # d'un plan sont attribuées à un autre, silencieusement. Le moteur graphe
++        # (`--engine graph`) reprend le batch image par image ; ici on échoue.
++        if len(all_semantics) != len(valid_pairs):
++            raise RuntimeError(
++                f"Désalignement analyses/segments : {len(all_semantics)} pour "
++                f"{len(valid_pairs)} vignettes. Utiliser --engine graph, qui "
++                f"reprend le batch unitairement au lieu de deviner l'appariement."
++            )
++
+         # Merge technical + semantic data
+         for i, (seg_dict, thumb_path) in enumerate(valid_pairs):
+             semantics = next((s for s in all_semantics if s.segment_index == i + 1), None)
+diff --git a/src/agents/annotator.py b/src/agents/annotator.py
+new file mode 100644
+index 0000000..313fc9e
+--- /dev/null
++++ b/src/agents/annotator.py
+@@ -0,0 +1,174 @@
++"""ANNOTATOR : rushes → sémantique par scène. Remplace la partie vision d'ANALYZER.
++
++Deux corrections de fond par rapport à `analyzer.py` :
++
++1. **Alignement strict.** L'ancien code appariait analyses et segments via
++   `next(s for s in all_semantics if s.segment_index == i + 1)` puis se rabattait
++   sur `all_semantics[i]`. Si un batch renvoyait 3 analyses pour 4 images, tous
++   les segments suivants étaient décalés — la note et l'émotion d'un plan
++   attribuées à un autre, silencieusement. Ici, un batch dont le compte ne
++   correspond pas est repassé image par image, ce qui rend le décalage
++   impossible par construction.
++
++2. **Échec explicite.** L'ancien fallback écrivait `quality_score=0.5,
++   emotion="neutral"` : indiscernable en aval d'une vraie analyse. Ici l'échec
++   est porté par le contrat (`failed=True`) et le segment est écarté du pool de
++   candidats plutôt que maquillé en donnée valide.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++from pydantic import BaseModel, Field
++
++from src.agents.base_agent import BaseAgent
++from src.config import ANALYZER_MODEL, ANNOTATE_BATCH_SIZE
++from src.video.thumbnails import build_vision_content
++
++SYSTEM_PROMPT = """You are an expert video editor and cinematographer analyzing raw video rushes.
++
++For each numbered frame, return one analysis, in the same order, with the same count.
++
++1. quality_score (0.0-1.0): focus, exposure, composition, framing
++2. semantic_tags: what is happening
++3. emotion: dominant emotion
++4. suggested_role: narrative role in an edit
++5. include_recommendation: worth including at all
++
++Be critical and honest. Return EXACTLY one entry per frame shown, in order."""
++
++
++class SegmentSemantics(BaseModel):
++    segment_index: int
++    quality_score: float = Field(ge=0.0, le=1.0)
++    semantic_tags: list[str]
++    emotion: str
++    suggested_role: str
++    include_recommendation: bool
++    notes: str = ""
++    failed: bool = False
++
++
++class BatchAnalysis(BaseModel):
++    segments: list[SegmentSemantics]
++
++
++def _failed(index: int, why: str) -> SegmentSemantics:
++    return SegmentSemantics(
++        segment_index=index,
++        quality_score=0.0,
++        semantic_tags=[],
++        emotion="unknown",
++        suggested_role="unknown",
++        include_recommendation=False,
++        notes=why,
++        failed=True,
++    )
++
++
++class AnnotatorAgent(BaseAgent):
++    def __init__(self, model: str = ANALYZER_MODEL):
++        super().__init__(model=model)
++
++    def annotate(
++        self,
++        rush_path: str,
++        scenes: list[tuple[float, float]],
++        thumbs: list[str],
++        batch_size: int = ANNOTATE_BATCH_SIZE,
++    ) -> list[SegmentSemantics]:
++        """Renvoie exactement `len(scenes)` analyses, dans l'ordre des scènes."""
++        if len(thumbs) != len(scenes):
++            raise ValueError(
++                f"{Path(rush_path).name}: {len(thumbs)} vignettes pour {len(scenes)} scènes"
++            )
++
++        out: list[SegmentSemantics] = []
++        for start in range(0, len(scenes), batch_size):
++            chunk = list(zip(scenes[start : start + batch_size], thumbs[start : start + batch_size]))
++            out.extend(self._batch(rush_path, chunk, start))
++
++        assert len(out) == len(scenes), "invariant d'alignement rompu"
++        return out
++
++    def _batch(
++        self, rush_path: str, chunk: list[tuple[tuple[float, float], str]], offset: int
++    ) -> list[SegmentSemantics]:
++        pairs = [
++            (
++                {
++                    "source_file": rush_path,
++                    "start_time": s,
++                    "end_time": e,
++                    "duration": e - s,
++                },
++                thumb,
++            )
++            for (s, e), thumb in chunk
++        ]
++
++        try:
++            result: BatchAnalysis = self.call(
++                system=SYSTEM_PROMPT,
++                user_content=build_vision_content(pairs)
++                + [
++                    {
++                        "type": "text",
++                        "text": (
++                            f"Renvoie exactement {len(pairs)} analyses, "
++                            "une par image, dans l'ordre."
++                        ),
++                    }
++                ],
++                output_schema=BatchAnalysis,
++                max_tokens=2048,
++            )
++        except Exception as e:  # noqa: BLE001
++            print(f"[ANNOTATOR] batch offset={offset} en échec ({e})")
++            return self._one_by_one(rush_path, chunk, offset, why=f"batch failed: {e}")
++
++        if len(result.segments) != len(pairs):
++            # Le décalage silencieux se jouait exactement ici. On ne devine pas
++            # l'appariement : on repasse image par image, l'alignement redevient
++            # trivialement vrai.
++            print(
++                f"[ANNOTATOR] batch offset={offset}: {len(result.segments)} analyses "
++                f"pour {len(pairs)} images → reprise unitaire"
++            )
++            return self._one_by_one(rush_path, chunk, offset, why="count mismatch")
++
++        for j, seg in enumerate(result.segments):
++            seg.segment_index = offset + j
++            seg.failed = False
++        return result.segments
++
++    def _one_by_one(
++        self,
++        rush_path: str,
++        chunk: list[tuple[tuple[float, float], str]],
++        offset: int,
++        why: str,
++    ) -> list[SegmentSemantics]:
++        out: list[SegmentSemantics] = []
++        for j, ((s, e), thumb) in enumerate(chunk):
++            index = offset + j
++            pair = [({"source_file": rush_path, "start_time": s, "end_time": e, "duration": e - s}, thumb)]
++            try:
++                single: BatchAnalysis = self.call(
++                    system=SYSTEM_PROMPT,
++                    user_content=build_vision_content(pair)
++                    + [{"type": "text", "text": "Renvoie exactement 1 analyse."}],
++                    output_schema=BatchAnalysis,
++                    max_tokens=512,
++                )
++                if len(single.segments) != 1:
++                    out.append(_failed(index, f"{why}; unitaire: {len(single.segments)} analyses"))
++                    continue
++                seg = single.segments[0]
++                seg.segment_index = index
++                seg.failed = False
++                out.append(seg)
++            except Exception as e2:  # noqa: BLE001
++                print(f"[ANNOTATOR] scène {index} non annotée: {e2}")
++                out.append(_failed(index, f"{why}; unitaire: {e2}"))
++        return out
+diff --git a/src/agents/comparator.py b/src/agents/comparator.py
+new file mode 100644
+index 0000000..5875847
+--- /dev/null
++++ b/src/agents/comparator.py
+@@ -0,0 +1,117 @@
++"""COMPARATOR : « lequel des deux ? » au lieu de « note sur 1.0 ».
++
++Pourquoi ce changement. Le CRITIC produisait un score absolu 0.0–1.0 comparé à
++un seuil de 0.70. Deux problèmes : la note d'un LLM sur une échelle absolue
++n'est pas stable d'un appel à l'autre (c'est exactement le reproche fait aux VLM
++noteurs), et le seuil n'était justifié par rien. Une comparaison par paires
++n'exige aucune calibration : elle ne demande qu'un ordre.
++
++Il reçoit les frames de raccord (`src/video/cuts.py`), pas trois keyframes
++prises au hasard dans le rendu : il juge enfin le montage et pas le contenu.
++"""
++from __future__ import annotations
++
++import json
++from typing import Literal
++
++from pydantic import BaseModel, Field
++
++from src.agents.base_agent import BaseAgent
++from src.assemble import Candidate, Preset, to_edit_plan
++from src.config import COMPARATOR_MODEL, COMPARATOR_MAX_CUTS
++from src.models import EditPlan, VideoSegment
++from src.video.cuts import cut_vision_blocks
++
++SYSTEM_PROMPT = """Tu es monteur. On te présente DEUX montages candidats construits à partir des mêmes rushes.
++
++Pour chacun : le plan de montage (durées, ordre, transitions, rôle et émotion de chaque plan) et des images de raccord — pour chaque coupe montrée, la dernière image du plan sortant puis la première du plan entrant.
++
++Choisis lequel des deux tu livrerais. Critères, par ordre d'importance :
++1. Les raccords fonctionnent-ils ? (saut d'axe, faux raccord, valeurs de plan identiques collées)
++2. Le rythme : la durée des plans varie-t-elle avec l'intention, ou est-ce mécanique ?
++3. L'arc : l'ordre construit-il quelque chose, ou est-ce une suite de bons plans ?
++
++Tu DOIS choisir. Pas d'égalité, pas de « ça dépend ». Si les deux se valent, tranche
++sur les raccords. Justifie en une phrase, en pointant un raccord ou un enchaînement précis."""
++
++
++class Comparison(BaseModel):
++    winner: Literal["A", "B"]
++    reason: str = Field(description="Une phrase, citant un raccord ou un enchaînement précis")
++    margin: Literal["nette", "faible"]
++
++
++def _plan_digest(plan: EditPlan) -> str:
++    """Résumé compact : on n'envoie pas l'EditPlan complet (segments verbeux)."""
++    rows = [
++        {
++            "n": e.order,
++            "src": e.segment.source_file.rsplit("/", 1)[-1],
++            "dur": round(e.segment.duration, 2),
++            "role": e.segment.suggested_role,
++            "emo": e.segment.emotion,
++            "q": round(e.segment.quality_score, 2),
++            "trans": e.transition_in,
++        }
++        for e in sorted(plan.edits, key=lambda e: e.order)
++    ]
++    return json.dumps(rows, ensure_ascii=False)
++
++
++class ComparatorAgent(BaseAgent):
++    def __init__(self, model: str = COMPARATOR_MODEL):
++        super().__init__(model=model)
++
++    def compare(
++        self,
++        a: Candidate,
++        b: Candidate,
++        segments: list[VideoSegment],
++        presets: dict[str, Preset],
++        max_cuts: int = COMPARATOR_MAX_CUTS,
++    ) -> Comparison:
++        plan_a = to_edit_plan(a, segments, presets[a.preset], title="A")
++        plan_b = to_edit_plan(b, segments, presets[b.preset], title="B")
++
++        content: list[dict] = [
++            {
++                "type": "text",
++                "text": (
++                    f"## Montage A\n{len(plan_a.edits)} plans, "
++                    f"{plan_a.total_duration:.1f}s\n```json\n{_plan_digest(plan_a)}\n```"
++                ),
++            }
++        ]
++        content += cut_vision_blocks(plan_a, tag="cmp_A", label="A", max_cuts=max_cuts)
++        content.append(
++            {
++                "type": "text",
++                "text": (
++                    f"\n## Montage B\n{len(plan_b.edits)} plans, "
++                    f"{plan_b.total_duration:.1f}s\n```json\n{_plan_digest(plan_b)}\n```"
++                ),
++            }
++        )
++        content += cut_vision_blocks(plan_b, tag="cmp_B", label="B", max_cuts=max_cuts)
++        content.append(
++            {"type": "text", "text": "\nLequel livres-tu ? Réponds via l'outil."}
++        )
++
++        return self.call(
++            system=SYSTEM_PROMPT,
++            user_content=content,
++            output_schema=Comparison,
++            max_tokens=512,
++        )
++
++    def as_callable(self, segments: list[VideoSegment], presets: dict[str, Preset]):
++        """Adaptateur pour `src.beam.rank`."""
++
++        def _cmp(a: Candidate, b: Candidate) -> tuple[str, str]:
++            verdict = self.compare(a, b, segments, presets)
++            label_a = f"{a.preset}#{a.rank_in_preset}"
++            label_b = f"{b.preset}#{b.rank_in_preset}"
++            winner = label_a if verdict.winner == "A" else label_b
++            return verdict.winner, f"{winner} ({verdict.margin}) — {verdict.reason}"
++
++        return _cmp
+diff --git a/src/assemble.py b/src/assemble.py
+new file mode 100644
+index 0000000..f98d0de
+--- /dev/null
++++ b/src/assemble.py
+@@ -0,0 +1,446 @@
++"""Assemblage de la timeline par programmation par contraintes.
++
++Le LLM n'écrit plus la timeline. Il annote (`quality_score`, rôle, émotion) ;
++le solveur sélectionne et ordonne sous contraintes explicites.
++
++Ce que ça change concrètement :
++  - l'optimum sous contraintes est atteint en un passage : il n'y a plus rien à
++    « réviser », donc plus de boucle ;
++  - le solveur énumère les K meilleures solutions distinctes, donc les
++    « alternates » sont gratuits — une boucle ne rend qu'un verdict ;
++  - les contraintes (« pas deux plans de la même source à la suite », « durée
++    entre 55 et 65 s ») se discutent avec un monteur, contrairement à un prompt.
++
++Formulation : x[i][p] = 1 si le segment i occupe la position p.
++"""
++from __future__ import annotations
++
++import math
++from typing import Literal, Sequence
++
++from ortools.sat.python import cp_model
++from pydantic import BaseModel, Field
++
++from src.models import EditPlan, TimelineEdit, VideoSegment
++
++# ── Échelles sémantiques ────────────────────────────────────────────────────
++# Le LLM produit des étiquettes ; ces tables les projettent sur [0,1] pour que
++# le solveur puisse arbitrer. Elles sont volontairement dans le code et pas dans
++# un prompt : ce sont des paramètres à régler, pas du langage à interpréter.
++
++ENERGY: dict[str, float] = {
++    "energetic": 1.00,
++    "joyful": 0.85,
++    "tense": 0.70,
++    "suspenseful": 0.65,
++    "neutral": 0.50,
++    "calm": 0.25,
++    "melancholic": 0.15,
++}
++
++ROLE_POSITION: dict[str, float] = {
++    "opening": 0.00,
++    "build_up": 0.35,
++    "climax": 0.65,
++    "resolution": 0.85,
++    "outro": 1.00,
++    "b_roll": 0.50,
++}
++
++CurveName = Literal["arc", "rise", "fall", "flat"]
++
++
++def energy_curve(name: CurveName, pos: float) -> float:
++    """Énergie visée à la position relative `pos` ∈ [0,1]."""
++    if name == "flat":
++        return 0.50
++    if name == "rise":
++        return 0.20 + 0.80 * pos
++    if name == "fall":
++        return 1.00 - 0.80 * pos
++    # "arc" : montée jusqu'au pic à 70 %, puis résolution
++    if pos <= 0.70:
++        return 0.20 + (1.00 - 0.20) * (pos / 0.70)
++    return 1.00 - (1.00 - 0.35) * ((pos - 0.70) / 0.30)
++
++
++# ── Préréglages = les « intentions » du faisceau ────────────────────────────
++
++
++class Preset(BaseModel):
++    """Une intention de montage, entièrement déclarative.
++
++    Ces profils sont déterministes : générer le faisceau ne coûte aucun token.
++    Le LLM n'intervient qu'au classement (cf. `src/beam.py`).
++    """
++
++    name: str
++    target_duration: float = 60.0
++    tolerance: float = 0.10
++    min_shot: float = 1.2
++    max_shot: float = 6.0
++    target_shot: float = 3.0
++
++    quality_weight: float = 1.0
++    role_weight: float = 0.6
++    energy_weight: float = 0.6
++    pacing_weight: float = 0.4
++
++    curve: CurveName = "arc"
++    respect_chronology: bool = False
++    forbid_same_source_adjacent: bool = True
++    require_opening_first: bool = True
++    require_closing_last: bool = True
++    min_shots: int = 4
++    shot_cost: float = 0.80  # péage par plan : un plan médiocre ne s'ajoute pas gratuitement
++
++    default_transition: str = "cut"
++    open_with_fade: bool = True
++    dissolve_on_emotion_change: bool = False
++
++
++PRESETS: dict[str, Preset] = {
++    "chronological": Preset(
++        name="chronological",
++        curve="rise",
++        respect_chronology=True,
++        target_shot=3.5,
++        quality_weight=1.0,
++        role_weight=0.2,
++        energy_weight=0.3,
++        forbid_same_source_adjacent=False,  # incompatible avec un ordre chronologique global
++        require_opening_first=False,
++        require_closing_last=False,
++    ),
++    "emotional_arc": Preset(
++        name="emotional_arc",
++        curve="arc",
++        energy_weight=1.2,
++        role_weight=0.9,
++        target_shot=3.5,
++        dissolve_on_emotion_change=True,
++    ),
++    "punchy": Preset(
++        name="punchy",
++        curve="rise",
++        min_shot=0.8,
++        max_shot=2.5,
++        target_shot=1.4,
++        pacing_weight=1.0,
++        energy_weight=0.9,
++        role_weight=0.3,
++        shot_cost=0.25,
++    ),
++    "contemplative": Preset(
++        name="contemplative",
++        curve="fall",
++        min_shot=2.5,
++        max_shot=9.0,
++        target_shot=5.5,
++        pacing_weight=0.8,
++        energy_weight=0.5,
++        shot_cost=1.40,
++        dissolve_on_emotion_change=True,
++    ),
++    "best_of": Preset(
++        name="best_of",
++        curve="flat",
++        quality_weight=2.0,
++        role_weight=0.0,
++        energy_weight=0.0,
++        pacing_weight=0.2,
++        require_opening_first=False,
++        require_closing_last=False,
++    ),
++}
++
++DEFAULT_BEAM = ["chronological", "emotional_arc", "punchy", "contemplative", "best_of"]
++
++
++# ── Sortie du solveur ───────────────────────────────────────────────────────
++
++
++class Pick(BaseModel):
++    index: int
++    start: float
++    end: float
++
++
++class Candidate(BaseModel):
++    preset: str
++    rank_in_preset: int
++    objective: int
++    bound: int
++    status: str
++    picks: list[Pick]
++
++    @property
++    def gap(self) -> float:
++        """Écart relatif à la borne supérieure. 0.0 = optimum prouvé."""
++        if self.bound <= 0:
++            return 0.0
++        return max(0.0, (self.bound - self.objective) / self.bound)
++
++    @property
++    def duration(self) -> float:
++        return sum(p.end - p.start for p in self.picks)
++
++    @property
++    def selection(self) -> frozenset[int]:
++        return frozenset(p.index for p in self.picks)
++
++
++def _trim(seg: VideoSegment, preset: Preset) -> tuple[float, float]:
++    """Ramène un segment dans [min_shot, max_shot], centré sur son milieu."""
++    dur = max(0.0, seg.end_time - seg.start_time)
++    use = min(dur, preset.max_shot)
++    offset = (dur - use) / 2.0
++    start = seg.start_time + offset
++    return start, start + use
++
++
++def _segment_score(seg: VideoSegment, use_dur: float, pos: float, preset: Preset) -> float:
++    role = ROLE_POSITION.get((seg.suggested_role or "").lower(), 0.5)
++    energy = ENERGY.get((seg.emotion or "").lower(), 0.5)
++    want = energy_curve(preset.curve, pos)
++
++    s = preset.quality_weight * seg.quality_score
++    s += preset.role_weight * (1.0 - abs(role - pos))
++    s += preset.energy_weight * (1.0 - abs(energy - want))
++    s -= preset.pacing_weight * min(
++        1.0, abs(use_dur - preset.target_shot) / max(0.5, preset.target_shot)
++    )
++    return s
++
++
++def solve(
++    segments: Sequence[VideoSegment],
++    preset: Preset,
++    k: int = 2,
++    min_diff: int = 3,
++    time_limit_s: float = 15.0,
++    deterministic: bool = True,
++) -> list[Candidate]:
++    """Retourne jusqu'à `k` timelines distinctes, classées par objectif.
++
++    `deterministic=True` n'est pas un confort : le cache de `src/graph.py` est
++    adressé par contenu, donc une fonction non déterministe le rend menteur —
++    la valeur relue diffère de la valeur qu'un recalcul produirait. CP-SAT en
++    portefeuille multi-thread avec limite d'horloge n'est pas reproductible ;
++    on passe donc à un worker et à une limite en temps *déterministe* (unités
++    de travail, pas de secondes), au prix de la vitesse.
++    """
++    usable = [
++        (i, s, *_trim(s, preset))
++        for i, s in enumerate(segments)
++        if (s.end_time - s.start_time) >= preset.min_shot
++    ]
++    if len(usable) < preset.min_shots:
++        return []
++
++    idx = [u[0] for u in usable]
++    segs = [u[1] for u in usable]
++    starts = [u[2] for u in usable]
++    ends = [u[3] for u in usable]
++    durs_ms = [int(round((e - s) * 1000)) for s, e in zip(starts, ends)]
++    n = len(segs)
++
++    lo_ms = int(preset.target_duration * (1 - preset.tolerance) * 1000)
++    hi_ms = int(preset.target_duration * (1 + preset.tolerance) * 1000)
++
++    n_pos = min(n, max(preset.min_shots, math.ceil(hi_ms / 1000 / preset.min_shot)))
++
++    model = cp_model.CpModel()
++    x = [[model.NewBoolVar(f"x_{i}_{p}") for p in range(n_pos)] for i in range(n)]
++    used = [model.NewBoolVar(f"used_{p}") for p in range(n_pos)]
++
++    for i in range(n):
++        model.AddAtMostOne(x[i])
++    for p in range(n_pos):
++        model.Add(sum(x[i][p] for i in range(n)) == used[p])
++    # Les positions occupées forment un préfixe : pas de trou dans la timeline.
++    for p in range(n_pos - 1):
++        model.Add(used[p] >= used[p + 1])
++
++    model.Add(sum(durs_ms[i] * x[i][p] for i in range(n) for p in range(n_pos)) >= lo_ms)
++    model.Add(sum(durs_ms[i] * x[i][p] for i in range(n) for p in range(n_pos)) <= hi_ms)
++    model.Add(sum(used) >= preset.min_shots)
++
++    if preset.forbid_same_source_adjacent:
++        by_source: dict[str, list[int]] = {}
++        for i, s in enumerate(segs):
++            by_source.setdefault(s.source_file, []).append(i)
++        for group in by_source.values():
++            if len(group) < 2:
++                continue
++            for p in range(n_pos - 1):
++                model.Add(sum(x[i][p] + x[i][p + 1] for i in group) <= 1)
++
++    if preset.respect_chronology:
++        rank = {i: r for r, i in enumerate(sorted(range(n), key=lambda j: (segs[j].source_file, segs[j].start_time)))}
++        order = []
++        for p in range(n_pos):
++            o = model.NewIntVar(0, n, f"o_{p}")
++            model.Add(o == sum((rank[i] + 1) * x[i][p] for i in range(n)))
++            order.append(o)
++        for p in range(n_pos - 1):
++            model.Add(order[p] < order[p + 1]).OnlyEnforceIf(used[p + 1])
++
++    if preset.require_opening_first:
++        openers = [i for i, s in enumerate(segs) if (s.suggested_role or "").lower() == "opening"]
++        if openers:
++            model.Add(sum(x[i][0] for i in openers) == 1)
++
++    if preset.require_closing_last:
++        closers = [
++            i
++            for i, s in enumerate(segs)
++            if (s.suggested_role or "").lower() in ("resolution", "outro")
++        ]
++        if closers:
++            for p in range(n_pos):
++                is_last = model.NewBoolVar(f"last_{p}")
++                if p == n_pos - 1:
++                    model.Add(is_last == used[p])
++                else:
++                    model.AddBoolAnd([used[p], used[p + 1].Not()]).OnlyEnforceIf(is_last)
++                    model.AddBoolOr([used[p].Not(), used[p + 1]]).OnlyEnforceIf(is_last.Not())
++                model.Add(sum(x[i][p] for i in closers) == 1).OnlyEnforceIf(is_last)
++
++    denom = max(1, n_pos - 1)
++    coeff = [
++        [
++            int(round(1000 * _segment_score(segs[i], durs_ms[i] / 1000.0, p / denom, preset)))
++            for p in range(n_pos)
++        ]
++        for i in range(n)
++    ]
++    shot_cost = int(round(1000 * preset.shot_cost))
++    model.Maximize(
++        sum(coeff[i][p] * x[i][p] for i in range(n) for p in range(n_pos))
++        - shot_cost * sum(used)
++    )
++
++    chosen = [model.NewBoolVar(f"chosen_{i}") for i in range(n)]
++    for i in range(n):
++        model.Add(chosen[i] == sum(x[i][p] for p in range(n_pos)))
++
++    out: list[Candidate] = []
++    for rank_i in range(k):
++        solver = cp_model.CpSolver()
++        if deterministic:
++            solver.parameters.num_workers = 1
++            solver.parameters.max_deterministic_time = time_limit_s
++            solver.parameters.max_time_in_seconds = time_limit_s * 4  # garde-fou
++        else:
++            solver.parameters.num_workers = 8
++            solver.parameters.max_time_in_seconds = time_limit_s
++        status = solver.Solve(model)
++        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
++            break
++
++        picks: list[Pick] = []
++        for p in range(n_pos):
++            for i in range(n):
++                if solver.Value(x[i][p]):
++                    picks.append(Pick(index=idx[i], start=starts[i], end=ends[i]))
++                    break
++        out.append(
++            Candidate(
++                preset=preset.name,
++                rank_in_preset=rank_i,
++                objective=int(solver.ObjectiveValue()),
++                bound=int(solver.BestObjectiveBound()),
++                status=solver.StatusName(status),
++                picks=picks,
++            )
++        )
++
++        # No-good de diversité : la solution suivante doit différer d'au moins
++        # `min_diff` segments — sinon on obtient K permutations du même montage.
++        sel = [i for i in range(n) if solver.Value(chosen[i])]
++        if not sel:
++            break
++        model.Add(sum(chosen[i] for i in sel) <= len(sel) - min_diff)
++
++    out.sort(key=lambda c: -c.objective)
++    for r, c in enumerate(out):
++        c.rank_in_preset = r
++    return out
++
++
++def to_edit_plan(
++    candidate: Candidate,
++    segments: Sequence[VideoSegment],
++    preset: Preset,
++    title: str | None = None,
++) -> EditPlan:
++    """Convertit une solution du solveur en `EditPlan` (contrat existant)."""
++    edits: list[TimelineEdit] = []
++    prev_emotion: str | None = None
++
++    for order, pick in enumerate(candidate.picks):
++        base = segments[pick.index]
++        seg = base.model_copy(
++            update={
++                "start_time": pick.start,
++                "end_time": pick.end,
++                "duration": pick.end - pick.start,
++            }
++        )
++
++        if order == 0 and preset.open_with_fade:
++            transition, tdur = "fade", 0.5
++        elif (
++            preset.dissolve_on_emotion_change
++            and prev_emotion is not None
++            and seg.emotion != prev_emotion
++        ):
++            transition, tdur = "dissolve", 0.4
++        else:
++            transition, tdur = preset.default_transition, 0.0
++
++        edits.append(
++            TimelineEdit(
++                order=order,
++                segment=seg,
++                transition_in=transition,
++                transition_duration=tdur,
++                audio_level=1.0,
++                speed_factor=1.0,
++            )
++        )
++        prev_emotion = seg.emotion
++
++    total = sum(e.segment.duration for e in edits)
++    return EditPlan(
++        title=title or f"montage_{preset.name}_{candidate.rank_in_preset}",
++        total_duration=total,
++        narrative_arc=(
++            f"preset={preset.name} · courbe={preset.curve} · "
++            f"{len(edits)} plans · objectif={candidate.objective}"
++        ),
++        edits=edits,
++        music_suggestion=None,
++    )
++
++
++def explain(candidate: Candidate, segments: Sequence[VideoSegment], preset: Preset) -> str:
++    """Trace lisible : pourquoi chaque plan est là. Auditable par un monteur."""
++    lines = [
++        f"[{preset.name}] rang {candidate.rank_in_preset} · objectif {candidate.objective} "
++        f"· {candidate.duration:.1f}s · {len(candidate.picks)} plans "
++        f"({candidate.status}, écart {candidate.gap:.1%})"
++    ]
++    denom = max(1, len(candidate.picks) - 1)
++    for p, pick in enumerate(candidate.picks):
++        s = segments[pick.index]
++        pos = p / denom
++        lines.append(
++            f"  {p:>2}. {s.source_file.rsplit('/', 1)[-1]} "
++            f"{pick.start:>7.2f}→{pick.end:<7.2f} ({pick.end - pick.start:.1f}s) "
++            f"q={s.quality_score:.2f} {s.suggested_role}/{s.emotion} "
++            f"| énergie visée {energy_curve(preset.curve, pos):.2f} "
++            f"| score {_segment_score(s, pick.end - pick.start, pos, preset):.3f}"
++        )
++    return "\n".join(lines)
+diff --git a/src/beam.py b/src/beam.py
+new file mode 100644
+index 0000000..3b6c7cb
+--- /dev/null
++++ b/src/beam.py
+@@ -0,0 +1,161 @@
++"""Faisceau de candidats + classement par comparaison par paires.
++
++Remplace la boucle CRITIC → REVISION → SCENARIO :
++
++  - la génération est un faisceau de N intentions **indépendantes** (donc
++    parallélisables, sans dépendance séquentielle) et entièrement déterministe :
++    les intentions sont des `Preset`, pas des prompts, donc générer le faisceau
++    coûte zéro token ;
++  - le classement est une comparaison par paires (« lequel des deux ? »), pas
++    une note absolue. Un LLM est nettement plus stable en comparatif qu'en
++    notation 0.0–1.0 — ce qui était le vice de fond du CRITIC et de son seuil
++    à 0.70 sorti de nulle part ;
++  - la sortie est un classement, pas un verdict : le premier va au monteur, les
++    suivants sont les alternates sur une timeline B.
++
++Une boucle ne peut structurellement pas produire un classement : elle converge
++vers un artefact unique.
++"""
++from __future__ import annotations
++
++import hashlib
++from typing import Callable, Iterable, Sequence
++
++from pydantic import BaseModel
++
++from src.assemble import PRESETS, Candidate, Preset, solve
++from src.models import VideoSegment
++
++# Un comparateur reçoit (a, b) et renvoie "A" ou "B" — plus une raison libre.
++Comparator = Callable[[Candidate, Candidate], tuple[str, str]]
++
++
++class RankedCandidate(BaseModel):
++    candidate: Candidate
++    rank: int
++    wins: int
++    notes: list[str] = []
++
++
++def generate(
++    segments: Sequence[VideoSegment],
++    preset_names: Iterable[str],
++    k_per_preset: int = 2,
++    time_limit_s: float = 15.0,
++) -> list[Candidate]:
++    """Génère le faisceau. Déterministe, aucun appel LLM.
++
++    Les presets sont indépendants : `solve` peut être lancé en parallèle
++    (ThreadPool ou nœuds de graphe séparés) sans rien changer au résultat.
++    """
++    out: list[Candidate] = []
++    for name in preset_names:
++        preset = PRESETS[name]
++        out.extend(solve(segments, preset, k=k_per_preset, time_limit_s=time_limit_s))
++    return out
++
++
++def _jaccard(a: frozenset[int], b: frozenset[int]) -> float:
++    if not a and not b:
++        return 1.0
++    return len(a & b) / max(1, len(a | b))
++
++
++def dedupe(candidates: Sequence[Candidate], threshold: float = 0.85) -> list[Candidate]:
++    """Élague les candidats trop proches : deux presets convergent souvent."""
++    kept: list[Candidate] = []
++    for c in candidates:
++        if any(_jaccard(c.selection, k.selection) >= threshold for k in kept):
++            continue
++        kept.append(c)
++    return kept
++
++
++def _orientation(a: Candidate, b: Candidate) -> bool:
++    """Ordre de présentation d'une paire, stable et sans biais systématique.
++
++    Un LLM favorise légèrement la première option présentée. On ne peut pas se
++    payer le double appel (A/B puis B/A), donc on rend l'orientation
++    pseudo-aléatoire mais déterministe : le biais ne s'aligne plus sur un preset.
++    """
++    key = "|".join(sorted([f"{a.preset}#{a.rank_in_preset}", f"{b.preset}#{b.rank_in_preset}"]))
++    return hashlib.sha256(key.encode()).digest()[0] % 2 == 0
++
++
++def rank(
++    candidates: Sequence[Candidate],
++    comparator: Comparator,
++    max_candidates: int = 6,
++) -> tuple[list[RankedCandidate], int]:
++    """Trie les candidats par tri fusion, comparateur mémoïsé.
++
++    Renvoie (classement, nombre d'appels au comparateur). Le tri fusion donne
++    ~n·log2(n) comparaisons — 6 candidats ≈ 10 appels, à comparer aux 3 appels
++    CRITIC + 2 REVISION de la boucle, pour un résultat classé et non un verdict.
++    """
++    pool = list(candidates)[:max_candidates]
++    if len(pool) <= 1:
++        return [RankedCandidate(candidate=c, rank=i, wins=0) for i, c in enumerate(pool)], 0
++
++    memo: dict[tuple[int, int], tuple[str, str]] = {}
++    wins: dict[int, int] = {id(c): 0 for c in pool}
++    notes: dict[int, list[str]] = {id(c): [] for c in pool}
++    calls = 0
++
++    def better(a: Candidate, b: Candidate) -> bool:
++        """True si a passe devant b."""
++        nonlocal calls
++        ka, kb = id(a), id(b)
++        cache_key = (min(ka, kb), max(ka, kb))
++        if cache_key not in memo:
++            first, second = (a, b) if _orientation(a, b) else (b, a)
++            verdict, reason = comparator(first, second)
++            calls += 1
++            winner = first if verdict.upper() == "A" else second
++            memo[cache_key] = ("A" if winner is a else "B", reason)
++            wins[id(winner)] += 1
++            notes[ka].append(reason)
++            notes[kb].append(reason)
++        return memo[cache_key][0] == "A"
++
++    def merge_sort(items: list[Candidate]) -> list[Candidate]:
++        if len(items) <= 1:
++            return items
++        mid = len(items) // 2
++        left, right = merge_sort(items[:mid]), merge_sort(items[mid:])
++        merged: list[Candidate] = []
++        i = j = 0
++        while i < len(left) and j < len(right):
++            if better(left[i], right[j]):
++                merged.append(left[i]); i += 1
++            else:
++                merged.append(right[j]); j += 1
++        return merged + left[i:] + right[j:]
++
++    ordered = merge_sort(pool)
++    return (
++        [
++            RankedCandidate(
++                candidate=c, rank=r, wins=wins[id(c)], notes=notes[id(c)][:3]
++            )
++            for r, c in enumerate(ordered)
++        ],
++        calls,
++    )
++
++
++def objective_prefilter(candidates: Sequence[Candidate], per_preset: int = 1) -> list[Candidate]:
++    """Pré-filtre déterministe avant le classement LLM.
++
++    Les objectifs de presets différents ne sont PAS comparables entre eux (ce
++    sont des fonctions objectif différentes) : on ne garde donc que les
++    meilleurs *au sein* de chaque preset, jamais un tri global par objectif.
++    """
++    by_preset: dict[str, list[Candidate]] = {}
++    for c in candidates:
++        by_preset.setdefault(c.preset, []).append(c)
++    out: list[Candidate] = []
++    for group in by_preset.values():
++        group.sort(key=lambda c: -c.objective)
++        out.extend(group[:per_preset])
++    return out
+diff --git a/src/config.py b/src/config.py
+index dc70198..335fa9d 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -11,6 +11,7 @@ SCENARIO_MODEL = "claude-sonnet-4-6"            # needs reasoning
+ CRITIC_MODEL = "claude-sonnet-4-6"              # needs reasoning
+ REVISION_MODEL = "claude-haiku-4-5-20251001"    # translation, not creation
+ QUALITY_MODEL = "claude-haiku-4-5-20251001"     # simple gate
++COMPARATOR_MODEL = "claude-sonnet-4-6"          # comparaison par paires (moteur graphe)
+ 
+ # Paths
+ BASE_DIR = Path(__file__).parent.parent
+@@ -20,10 +21,20 @@ RUSHES_DIR = BASE_DIR / "rushes"
+ 
+ # Video settings
+ TARGET_MONTAGE_DURATION = 60  # seconds, default target
+-MAX_SEGMENTS_PER_RUSH = 10
+-THUMBNAIL_TIME_OFFSET = 0.1   # fraction into segment for thumbnail
++MAX_SEGMENTS_PER_RUSH = 40    # échantillonné uniformément, plus tronqué aux N premières
++THUMBNAIL_TIME_OFFSET = 0.3   # fraction into segment for thumbnail
++
++# ── Moteur graphe + solveur + faisceau (src/pipeline.py) ────────────────────
++CACHE_DIR = BASE_DIR / "output" / "cache"
++ANNOTATE_BATCH_SIZE = 4       # images par appel vision
++K_PER_PRESET = 2              # solutions distinctes demandées au solveur par intention
++SOLVER_TIME_LIMIT_S = 15.0
++DEDUPE_THRESHOLD = 0.85       # Jaccard au-delà duquel deux candidats sont redondants
++MAX_CANDIDATES = 6            # plafond de candidats soumis au classement LLM
++COMPARATOR_MAX_CUTS = 4       # raccords montrés par candidat
+ 
+ # Ensure output dirs exist
+ OUTPUT_DIR.mkdir(exist_ok=True)
++CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ THUMBNAILS_DIR.mkdir(exist_ok=True)
+ RUSHES_DIR.mkdir(exist_ok=True)
+diff --git a/src/graph.py b/src/graph.py
+new file mode 100644
+index 0000000..12e15e8
+--- /dev/null
++++ b/src/graph.py
+@@ -0,0 +1,238 @@
++"""Graphe de dépendances adressé par contenu.
++
++Remplace l'ordonnancement impératif de `orchestrator.py` : on ne décrit plus une
++suite d'étapes, on déclare des artefacts dérivés. Chaque noeud porte une clé
++`sha256(nom + version + params + clés des dépendances)` ; demander un artefact
++remonte le graphe et ne matérialise que ce qui manque.
++
++Conséquences :
++  - la reprise après crash est une propriété du cache, pas une feature ;
++  - ajouter un rush ne réanalyse que ce rush ;
++  - changer la durée cible invalide le plan mais pas les annotations vision ;
++  - une correction du monteur est une entrée du graphe, pas une étape finale.
++
++Le corps de `fn` n'est volontairement PAS haché : un hash de bytecode invalide
++tout le cache à chaque reformatage. C'est `version` qui déclare qu'un calcul a
++changé de sémantique — à incrémenter à la main, comme une migration.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import shutil
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Iterable, Literal
++
++from pydantic import BaseModel
++
++Codec = Literal["json", "pydantic", "pydantic_list", "path", "path_list"]
++
++_FINGERPRINT_CHUNK = 4 * 1024 * 1024  # 4 Mo en tête et en queue
++
++
++def _canon(obj: Any) -> str:
++    """Sérialisation canonique et stable d'un dict de paramètres."""
++    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
++
++
++def fingerprint_file(path: str | Path) -> str:
++    """Empreinte d'un fichier source.
++
++    Taille + 4 Mo de tête + 4 Mo de queue. On ne hache pas les 40 Go de rushes :
++    la probabilité de collision sur des fichiers vidéo distincts est négligeable
++    et le coût d'un hash complet ferait perdre l'intérêt du cache.
++    """
++    p = Path(path)
++    size = p.stat().st_size
++    h = hashlib.sha256()
++    h.update(str(size).encode())
++    with p.open("rb") as f:
++        h.update(f.read(_FINGERPRINT_CHUNK))
++        if size > 2 * _FINGERPRINT_CHUNK:
++            f.seek(-_FINGERPRINT_CHUNK, 2)
++            h.update(f.read(_FINGERPRINT_CHUNK))
++    return h.hexdigest()[:24]
++
++
++@dataclass
++class Node:
++    """Un artefact dérivé.
++
++    `fn` reçoit les valeurs résolues des dépendances en kwargs, plus `**params`.
++    """
++
++    name: str
++    fn: Callable[..., Any] | None = None
++    deps: dict[str, "Node"] = field(default_factory=dict)
++    params: dict[str, Any] = field(default_factory=dict)
++    version: str = "1"
++    codec: Codec = "json"
++    model: type[BaseModel] | None = None
++    label: str | None = None  # affichage seulement, hors clé
++
++    _key: str | None = field(default=None, repr=False, compare=False)
++
++    def key(self) -> str:
++        if self._key is None:
++            h = hashlib.sha256()
++            h.update(self.name.encode())
++            h.update(b"\x00")
++            h.update(self.version.encode())
++            h.update(b"\x00")
++            h.update(_canon(self.params).encode())
++            for dep_name in sorted(self.deps):
++                h.update(b"\x00")
++                h.update(dep_name.encode())
++                h.update(b"=")
++                h.update(self.deps[dep_name].key().encode())
++            self._key = h.hexdigest()[:24]
++        return self._key
++
++    def walk(self) -> Iterable["Node"]:
++        """Post-ordre : dépendances avant le noeud."""
++        for dep in self.deps.values():
++            yield from dep.walk()
++        yield self
++
++    def __str__(self) -> str:
++        return f"{self.name}:{self.key()[:8]}"
++
++
++def source(path: str | Path, name: str = "source") -> Node:
++    """Noeud feuille : un fichier d'entrée, identifié par son empreinte.
++
++    `fn` avale les params (`materialize` les passe systématiquement) : ils sont
++    là pour la clé, pas pour le calcul.
++    """
++    p = Path(path).resolve()
++    return Node(
++        name=name,
++        fn=lambda **_: str(p),
++        params={"fingerprint": fingerprint_file(p), "suffix": p.suffix},
++        codec="json",
++        label=p.name,
++    )
++
++
++class Store:
++    """Cache disque. Un sous-dossier par nom de noeud, un fichier par clé."""
++
++    def __init__(self, root: str | Path):
++        self.root = Path(root)
++        self.root.mkdir(parents=True, exist_ok=True)
++
++    def _slot(self, node: Node) -> Path:
++        return self.root / node.name / node.key()
++
++    def has(self, node: Node) -> bool:
++        slot = self._slot(node)
++        if node.codec in ("path", "path_list"):
++            return (slot / "manifest.json").exists()
++        return slot.with_suffix(".json").exists()
++
++    def get(self, node: Node) -> Any:
++        slot = self._slot(node)
++        if node.codec in ("path", "path_list"):
++            names = json.loads((slot / "manifest.json").read_text())
++            paths = [str(slot / n) for n in names]
++            return paths if node.codec == "path_list" else paths[0]
++
++        raw = json.loads(slot.with_suffix(".json").read_text(encoding="utf-8"))
++        if node.codec == "pydantic":
++            assert node.model is not None, f"{node.name}: codec pydantic sans model"
++            return node.model.model_validate(raw)
++        if node.codec == "pydantic_list":
++            assert node.model is not None, f"{node.name}: codec pydantic_list sans model"
++            return [node.model.model_validate(r) for r in raw]
++        return raw
++
++    def put(self, node: Node, value: Any) -> Any:
++        slot = self._slot(node)
++        slot.parent.mkdir(parents=True, exist_ok=True)
++
++        if node.codec in ("path", "path_list"):
++            slot.mkdir(parents=True, exist_ok=True)
++            srcs = value if node.codec == "path_list" else [value]
++            names: list[str] = []
++            for src in srcs:
++                src_p = Path(src)
++                dest = slot / src_p.name
++                if src_p.resolve() != dest.resolve():
++                    shutil.copy2(src_p, dest)
++                names.append(src_p.name)
++            (slot / "manifest.json").write_text(json.dumps(names))
++            out = [str(slot / n) for n in names]
++            return out if node.codec == "path_list" else out[0]
++
++        if node.codec == "pydantic":
++            raw = value.model_dump(mode="json")
++        elif node.codec == "pydantic_list":
++            raw = [v.model_dump(mode="json") for v in value]
++        else:
++            raw = value
++
++        tmp = slot.with_suffix(".json.tmp")
++        tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
++        tmp.replace(slot.with_suffix(".json"))  # écriture atomique
++        return value
++
++
++def stale(node: Node, store: Store) -> list[Node]:
++    """Noeuds à recalculer si on demande `node` maintenant."""
++    seen: set[str] = set()
++    todo: list[Node] = []
++    for n in node.walk():
++        if n.key() in seen:
++            continue
++        seen.add(n.key())
++        if not store.has(n):
++            todo.append(n)
++    return todo
++
++
++def materialize(node: Node, store: Store, on_event: Callable[..., None] | None = None) -> Any:
++    """Matérialise `node`, en ne calculant que les noeuds absents du cache."""
++    memo: dict[str, Any] = {}
++
++    def emit(kind: str, n: Node, detail: str = "") -> None:
++        if on_event:
++            on_event(kind, n, detail)
++
++    for n in node.walk():
++        k = n.key()
++        if k in memo:
++            continue
++        if store.has(n):
++            memo[k] = store.get(n)
++            emit("hit", n)
++            continue
++        if n.fn is None:
++            raise RuntimeError(f"Noeud {n} absent du cache et sans fn")
++        emit("miss", n)
++        kwargs = {dep_name: memo[dep.key()] for dep_name, dep in n.deps.items()}
++        value = n.fn(**kwargs, **n.params)
++        memo[k] = store.put(n, value)
++        emit("done", n)
++
++    return memo[node.key()]
++
++
++def render_plan(node: Node, store: Store) -> str:
++    """Rendu texte du graphe avec l'état du cache — pour le debug et les slides."""
++    lines: list[str] = []
++    seen: set[str] = set()
++
++    def rec(n: Node, depth: int) -> None:
++        mark = "✓" if store.has(n) else "•"
++        dup = " (déjà)" if n.key() in seen else ""
++        label = f" [{n.label}]" if n.label else ""
++        lines.append(f"{'  ' * depth}{mark} {n.name}:{n.key()[:8]}{label}{dup}")
++        if n.key() in seen:
++            return
++        seen.add(n.key())
++        for dep in n.deps.values():
++            rec(dep, depth + 1)
++
++    rec(node, 0)
++    return "\n".join(lines)
+diff --git a/src/main.py b/src/main.py
+index bf8bb9f..31f4285 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -7,9 +7,57 @@ from pathlib import Path
+ 
+ from dotenv import load_dotenv
+ 
++from src.assemble import DEFAULT_BEAM, PRESETS
++from src.config import TARGET_MONTAGE_DURATION
++
+ load_dotenv()
+ 
+ 
++def _run_graph(args, rush_paths) -> int:
++    """Moteur graphe : aucune boucle, sortie classée."""
++    from src.pipeline import Run, run as run_pipeline
++
++    preset_names = [p.strip() for p in args.presets.split(",") if p.strip()]
++    unknown = [p for p in preset_names if p not in PRESETS]
++    if unknown:
++        print(f"Error: preset(s) inconnu(s): {', '.join(unknown)}")
++        print(f"Disponibles: {', '.join(PRESETS)}")
++        return 1
++
++    if args.explain:
++        r = Run(rush_paths, preset_names=preset_names, target_duration=args.duration, verbose=False)
++        print(r.plan("ranked"))
++        todo = r.todo("ranked")
++        print(f"\n{len(todo)} nœud(s) à recalculer :")
++        for n in todo:
++            print(f"  • {n.name}:{n.key()[:8]}" + (f" [{n.label}]" if n.label else ""))
++        print("\n(✓ = déjà en cache, • = à calculer)")
++        return 0
++
++    r = run_pipeline(
++        rush_paths,
++        preset_names,
++        render=not args.no_render,
++        export=True,
++        target_duration=args.duration,
++    )
++
++    if args.resolve:
++        from src.export_resolve import build_timeline_in_resolve
++        from src.models import EditPlan
++
++        plan = EditPlan.model_validate(r.get("ranked")["plans"][0])
++        print("\nBuilding timeline in DaVinci Resolve…")
++        try:
++            build_timeline_in_resolve(plan)
++        except SystemExit as e:
++            print(f"Resolve build skipped: {e}")
++        except Exception as e:  # noqa: BLE001
++            print(f"Resolve build failed: {e}")
++
++    return 0
++
++
+ def main():
+     parser = argparse.ArgumentParser(
+         description="Automatic video montage using AI agents",
+@@ -19,6 +67,14 @@ Examples:
+   python -m src.main rushes/clip1.mp4 rushes/clip2.mp4
+   python -m src.main rushes/*.mp4 --max-iter 2
+   python -m src.main rushes/ --output output/my_montage.mp4
++
++  # moteur graphe + solveur + faisceau (défaut)
++  python -m src.main rushes/ --engine graph
++  python -m src.main rushes/ --engine graph --presets punchy,emotional_arc --duration 90
++  python -m src.main rushes/ --engine graph --explain      # que recalculerait-on ?
++
++  # ancienne machine à états avec boucle de révision
++  python -m src.main rushes/ --engine loop --max-iter 3
+         """,
+     )
+     parser.add_argument(
+@@ -26,6 +82,36 @@ Examples:
+         nargs="+",
+         help="Video files or a directory containing video files",
+     )
++    parser.add_argument(
++        "--engine",
++        choices=("graph", "loop"),
++        default="graph",
++        help="graph = graphe de dépendances + CP-SAT + faisceau classé (défaut) ; "
++             "loop = machine à états historique avec boucle CRITIC→REVISION",
++    )
++    parser.add_argument(
++        "--presets",
++        type=str,
++        default=",".join(DEFAULT_BEAM),
++        help=f"Intentions du faisceau, séparées par des virgules. Disponibles : "
++             f"{', '.join(PRESETS)}",
++    )
++    parser.add_argument(
++        "--duration",
++        type=float,
++        default=TARGET_MONTAGE_DURATION,
++        help="Durée cible du montage en secondes (moteur graph)",
++    )
++    parser.add_argument(
++        "--no-render",
++        action="store_true",
++        help="Produire plan et exports NLE sans rendre le mp4 (moteur graph)",
++    )
++    parser.add_argument(
++        "--explain",
++        action="store_true",
++        help="Afficher le graphe et les nœuds à recalculer, puis sortir",
++    )
+     parser.add_argument(
+         "--max-iter",
+         type=int,
+@@ -76,6 +162,9 @@ Examples:
+         print(f"  • {p}")
+     print()
+ 
++    if args.engine == "graph":
++        return _run_graph(args, rush_paths)
++
+     from src.orchestrator import Orchestrator
+ 
+     orchestrator = Orchestrator(max_iterations=args.max_iter)
+diff --git a/src/nodes.py b/src/nodes.py
+new file mode 100644
+index 0000000..1158cda
+--- /dev/null
++++ b/src/nodes.py
+@@ -0,0 +1,353 @@
++"""Définition du graphe d'artefacts.
++
++C'est ici que le workflow cesse d'être une chaîne : on ne décrit aucun ordre
++d'exécution, seulement qui dépend de quoi. Les nœuds par rush (`probe`,
++`scenes`, `thumbs`, `annot`) sont indépendants entre rushes — ajouter un fichier
++n'invalide que ses propres nœuds ; changer la durée cible n'invalide que
++`candidates` et l'aval, jamais les annotations vision, qui sont le poste de coût.
++
++Le monteur est une entrée du graphe comme une autre : `overrides` (segments
++bannis, segments imposés) est un paramètre de `candidates`. Le corriger
++invalide le plan, pas l'analyse — ce que la boucle ne savait pas faire.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any, Sequence
++
++from src.assemble import PRESETS, Candidate, Preset, to_edit_plan
++from src.graph import Node, source
++from src.models import AnalysisResult, EditPlan, MontageResult, VideoSegment
++
++# Versions de calcul. À incrémenter quand la *sémantique* d'un nœud change —
++# c'est la migration du cache. Le corps des fonctions n'est pas haché.
++V = {
++    "probe": "1",
++    "scenes": "1",
++    "thumbs": "1",
++    "annot": "2",  # 2 = alignement strict + échec explicite
++    "segments": "2",
++    "candidates": "1",
++    "ranked": "1",
++    "render": "1",
++    "exports": "1",
++}
++
++
++# ── Fonctions de calcul ─────────────────────────────────────────────────────
++
++
++def _probe(rush: str) -> dict:
++    from src.video.probe import probe_video
++
++    return probe_video(rush).model_dump(mode="json")
++
++
++def _scenes(rush: str, threshold: float, max_segments: int, min_duration: float) -> list[list[float]]:
++    from src.video.probe import detect_scenes
++
++    scenes = [s for s in detect_scenes(rush, threshold=threshold) if s[1] - s[0] >= min_duration]
++    if len(scenes) > max_segments:
++        # Échantillonnage uniforme sur toute la durée. L'ancien `scenes[:10]`
++        # gardait les dix PREMIÈRES scènes : sur un mariage de 40 min, le
++        # système ne voyait jamais la fin.
++        step = len(scenes) / max_segments
++        scenes = [scenes[int(i * step)] for i in range(max_segments)]
++    return [[float(s), float(e)] for s, e in scenes]
++
++
++def _thumbs(rush: str, scenes: list[list[float]], offset: float) -> list[str]:
++    from src.video.thumbnails import extract_thumbnail
++
++    stem = Path(rush).stem
++    out: list[str] = []
++    for i, (s, e) in enumerate(scenes):
++        t = s + (e - s) * offset
++        out.append(extract_thumbnail(rush, t, f"{stem}_sc{i:03d}", width=640))
++    return out
++
++
++def _annot(rush: str, scenes: list[list[float]], thumbs: list[str], model: str) -> list[dict]:
++    from src.agents.annotator import AnnotatorAgent
++
++    agent = AnnotatorAgent(model=model)
++    sem = agent.annotate(rush, [(s, e) for s, e in scenes], thumbs)
++    return [x.model_dump(mode="json") for x in sem]
++
++
++def _segments(n_rushes: int, drop_failed: bool, **arts: Any) -> dict:
++    """Fusionne les nœuds par rush en un `AnalysisResult`.
++
++    Ce nœud ne prend AUCUN paramètre de montage. C'est délibéré : il porte le
++    résultat de la vision, qui est le poste de coût. Y glisser la durée cible
++    (comme je l'avais fait d'abord) suffisait à faire réannoter tous les rushes
++    dès qu'on passait de 60 à 90 s — soit exactement ce que le graphe est censé
++    empêcher. Le test `test_changing_duration_spares_the_vision_nodes` existe
++    pour attraper cette régression.
++    """
++    segments: list[VideoSegment] = []
++    total = 0.0
++    dropped = 0
++
++    for i in range(n_rushes):
++        rush = arts[f"rush_{i}"]
++        scenes = arts[f"scenes_{i}"]
++        thumbs = arts[f"thumbs_{i}"]
++        annots = arts[f"annot_{i}"]
++        total += float(arts[f"probe_{i}"]["duration"])
++
++        for j, ((s, e), thumb, a) in enumerate(zip(scenes, thumbs, annots)):
++            if drop_failed and a.get("failed"):
++                dropped += 1
++                continue
++            segments.append(
++                VideoSegment(
++                    source_file=rush,
++                    start_time=float(s),
++                    end_time=float(e),
++                    duration=float(e - s),
++                    quality_score=float(a["quality_score"]),
++                    semantic_tags=list(a["semantic_tags"]),
++                    emotion=str(a["emotion"]),
++                    suggested_role=str(a["suggested_role"]),
++                    thumbnail_path=thumb,
++                )
++            )
++
++    summary = f"{len(segments)} segments retenus sur {n_rushes} rush(es)"
++    if dropped:
++        summary += f" — {dropped} écarté(s) pour annotation en échec"
++
++    return AnalysisResult(
++        segments=segments,
++        total_rushes_duration=total,
++        recommended_output_duration=total,  # la cible appartient aux presets
++        summary=summary,
++    ).model_dump(mode="json")
++
++
++def _candidates(
++    analysis: dict,
++    presets: list[dict],
++    k_per_preset: int,
++    time_limit_s: float,
++    banned: list[str],
++    dedupe_threshold: float,
++) -> list[dict]:
++    from src import beam
++    from src.assemble import solve
++
++    segs = AnalysisResult.model_validate(analysis).segments
++    if banned:
++        blocked = set(banned)
++        segs = [s for s in segs if f"{s.source_file}@{s.start_time:.3f}" not in blocked]
++
++    out: list[Candidate] = []
++    for pdict in presets:
++        # Les presets sont indépendants : aucune dépendance entre eux, donc
++        # parallélisables tels quels (ThreadPool ou nœuds de graphe séparés).
++        out.extend(solve(segs, Preset.model_validate(pdict), k=k_per_preset, time_limit_s=time_limit_s))
++    return [c.model_dump(mode="json") for c in beam.dedupe(out, threshold=dedupe_threshold)]
++
++
++def _ranked(
++    analysis: dict,
++    candidates: list[dict],
++    presets: list[dict],
++    model: str,
++    max_candidates: int,
++    per_preset: int,
++) -> dict:
++    from src import beam
++    from src.agents.comparator import ComparatorAgent
++
++    segs = AnalysisResult.model_validate(analysis).segments
++    preset_map = {p["name"]: Preset.model_validate(p) for p in presets}
++    cands = [Candidate.model_validate(c) for c in candidates]
++    cands = beam.objective_prefilter(cands, per_preset=per_preset)
++
++    if len(cands) <= 1:
++        ranked = [
++            beam.RankedCandidate(candidate=c, rank=i, wins=0) for i, c in enumerate(cands)
++        ]
++        calls = 0
++    else:
++        agent = ComparatorAgent(model=model)
++        ranked, calls = beam.rank(
++            cands, agent.as_callable(segs, preset_map), max_candidates=max_candidates
++        )
++
++    return {
++        "comparisons": calls,
++        "ranked": [r.model_dump(mode="json") for r in ranked],
++        "plans": [
++            to_edit_plan(
++                Candidate.model_validate(r.candidate.model_dump()),
++                segs,
++                preset_map[r.candidate.preset],
++                title=f"{r.rank + 1:02d}_{r.candidate.preset}",
++            ).model_dump(mode="json")
++            for r in ranked
++        ],
++    }
++
++
++def _render(ranked: dict, which: int, output_dir: str) -> str:
++    from src.video.editor import execute_edit_plan
++
++    plan = EditPlan.model_validate(ranked["plans"][which])
++    out = str(Path(output_dir) / f"montage_{which:02d}_{plan.title}.mp4")
++    result: MontageResult = execute_edit_plan(plan, out)
++    return result.output_path
++
++
++def _exports(ranked: dict, which: int, output_dir: str) -> list[str]:
++    from src.export import export_all
++
++    plan = EditPlan.model_validate(ranked["plans"][which])
++    return sorted(export_all(plan, output_dir).values())
++
++
++# ── Construction du graphe ──────────────────────────────────────────────────
++
++
++def resolve_presets(names: Sequence[str], **overrides: Any) -> list[Preset]:
++    """Applique les surcharges globales (durée cible…) aux presets choisis."""
++    out = []
++    for n in names:
++        base = PRESETS[n].model_dump()
++        base.update({k: v for k, v in overrides.items() if v is not None})
++        base["name"] = n
++        out.append(Preset.model_validate(base))
++    return out
++
++
++def build(
++    rush_paths: Sequence[str],
++    *,
++    presets: Sequence[Preset],
++    annot_model: str,
++    comparator_model: str,
++    output_dir: str,
++    scene_threshold: float = 0.25,
++    max_segments_per_rush: int = 40,
++    min_scene_duration: float = 0.6,
++    thumbnail_offset: float = 0.3,
++    k_per_preset: int = 2,
++    solver_time_limit_s: float = 15.0,
++    banned_segments: Sequence[str] = (),
++    dedupe_threshold: float = 0.85,
++    max_candidates: int = 6,
++    per_preset_prefilter: int = 1,
++    drop_failed_annotations: bool = True,
++    target_duration: float = 60.0,
++) -> dict[str, Node]:
++    """Renvoie les nœuds terminaux nommés : `segments`, `candidates`, `ranked`,
++    `render`, `exports`. On matérialise celui dont on a besoin, pas plus."""
++    merge_deps: dict[str, Node] = {}
++
++    for i, path in enumerate(sorted(rush_paths)):
++        src = source(path, name="rush")
++        probe = Node("probe", _probe, {"rush": src}, version=V["probe"], label=Path(path).name)
++        scenes = Node(
++            "scenes",
++            _scenes,
++            {"rush": src},
++            params={
++                "threshold": scene_threshold,
++                "max_segments": max_segments_per_rush,
++                "min_duration": min_scene_duration,
++            },
++            version=V["scenes"],
++            label=Path(path).name,
++        )
++        thumbs = Node(
++            "thumbs",
++            _thumbs,
++            {"rush": src, "scenes": scenes},
++            params={"offset": thumbnail_offset},
++            version=V["thumbs"],
++            codec="path_list",
++            label=Path(path).name,
++        )
++        annot = Node(
++            "annot",
++            _annot,
++            {"rush": src, "scenes": scenes, "thumbs": thumbs},
++            params={"model": annot_model},
++            version=V["annot"],
++            label=Path(path).name,
++        )
++        merge_deps |= {
++            f"rush_{i}": src,
++            f"probe_{i}": probe,
++            f"scenes_{i}": scenes,
++            f"thumbs_{i}": thumbs,
++            f"annot_{i}": annot,
++        }
++
++    segments = Node(
++        "segments",
++        _segments,
++        merge_deps,
++        params={
++            "n_rushes": len(rush_paths),
++            "drop_failed": drop_failed_annotations,
++        },
++        version=V["segments"],
++    )
++
++    preset_dicts = [p.model_dump() for p in presets]
++
++    candidates = Node(
++        "candidates",
++        _candidates,
++        {"analysis": segments},
++        params={
++            "presets": preset_dicts,
++            "k_per_preset": k_per_preset,
++            "time_limit_s": solver_time_limit_s,
++            "banned": sorted(banned_segments),
++            "dedupe_threshold": dedupe_threshold,
++        },
++        version=V["candidates"],
++    )
++
++    ranked = Node(
++        "ranked",
++        _ranked,
++        {"analysis": segments, "candidates": candidates},
++        params={
++            "presets": preset_dicts,
++            "model": comparator_model,
++            "max_candidates": max_candidates,
++            "per_preset": per_preset_prefilter,
++        },
++        version=V["ranked"],
++    )
++
++    render = Node(
++        "render",
++        _render,
++        {"ranked": ranked},
++        params={"which": 0, "output_dir": output_dir},
++        version=V["render"],
++        codec="path",
++    )
++
++    exports = Node(
++        "exports",
++        _exports,
++        {"ranked": ranked},
++        params={"which": 0, "output_dir": output_dir},
++        version=V["exports"],
++        codec="path_list",
++    )
++
++    return {
++        "segments": segments,
++        "candidates": candidates,
++        "ranked": ranked,
++        "render": render,
++        "exports": exports,
++    }
+diff --git a/src/pipeline.py b/src/pipeline.py
+new file mode 100644
+index 0000000..86a03a4
+--- /dev/null
++++ b/src/pipeline.py
+@@ -0,0 +1,193 @@
++"""Point d'entrée du moteur « graphe + solveur + faisceau ».
++
++Comparé à `orchestrator.py` (machine à états avec boucle de révision) :
++
++  orchestrator : START → ANALYZE → SCENARIO → EDIT → CRITIC ⟲ REVISION → QUALITY
++                 un ordre écrit à la main, un artefact unique en sortie,
++                 rien de réutilisable entre deux runs.
++
++  pipeline     : on demande un artefact, le graphe remonte ses dépendances.
++                 L'assemblage est un problème d'optimisation résolu en un
++                 passage, le faisceau explore en parallèle, la sortie est un
++                 classement — pas un verdict.
++"""
++from __future__ import annotations
++
++import shutil
++import time
++from pathlib import Path
++from typing import Sequence
++
++from src import nodes
++from src.assemble import Candidate, Preset, explain
++from src.config import (
++    ANALYZER_MODEL,
++    CACHE_DIR,
++    COMPARATOR_MODEL,
++    DEDUPE_THRESHOLD,
++    K_PER_PRESET,
++    MAX_CANDIDATES,
++    MAX_SEGMENTS_PER_RUSH,
++    OUTPUT_DIR,
++    SOLVER_TIME_LIMIT_S,
++    TARGET_MONTAGE_DURATION,
++)
++from src.graph import Node, Store, materialize, render_plan, stale
++from src.models import AnalysisResult
++
++
++class Run:
++    """Un run = un graphe + un cache. Pas d'état mutable qui circule."""
++
++    def __init__(
++        self,
++        rush_paths: Sequence[str],
++        *,
++        preset_names: Sequence[str],
++        target_duration: float = TARGET_MONTAGE_DURATION,
++        max_segments_per_rush: int = MAX_SEGMENTS_PER_RUSH,
++        k_per_preset: int = K_PER_PRESET,
++        solver_time_limit_s: float = SOLVER_TIME_LIMIT_S,
++        max_candidates: int = MAX_CANDIDATES,
++        banned_segments: Sequence[str] = (),
++        cache_dir: str | Path = CACHE_DIR,
++        output_dir: str | Path = OUTPUT_DIR,
++        annot_model: str = ANALYZER_MODEL,
++        comparator_model: str = COMPARATOR_MODEL,
++        verbose: bool = True,
++    ):
++        self.verbose = verbose
++        self.output_dir = Path(output_dir)
++        self.store = Store(cache_dir)
++        self.presets: list[Preset] = nodes.resolve_presets(
++            preset_names, target_duration=target_duration
++        )
++        self.nodes: dict[str, Node] = nodes.build(
++            rush_paths,
++            presets=self.presets,
++            annot_model=annot_model,
++            comparator_model=comparator_model,
++            output_dir=str(output_dir),
++            max_segments_per_rush=max_segments_per_rush,
++            k_per_preset=k_per_preset,
++            solver_time_limit_s=solver_time_limit_s,
++            banned_segments=banned_segments,
++            dedupe_threshold=DEDUPE_THRESHOLD,
++            max_candidates=max_candidates,
++            target_duration=target_duration,
++        )
++
++    # ── introspection ───────────────────────────────────────────────────────
++
++    def plan(self, target: str = "ranked") -> str:
++        return render_plan(self.nodes[target], self.store)
++
++    def todo(self, target: str = "ranked") -> list[Node]:
++        """Ce qui serait recalculé — le reste est déjà en cache."""
++        return stale(self.nodes[target], self.store)
++
++    # ── exécution ───────────────────────────────────────────────────────────
++
++    def get(self, target: str):
++        node = self.nodes[target]
++        t0 = time.time()
++        hits = {"hit": 0, "done": 0}
++
++        def on_event(kind: str, n: Node, detail: str = "") -> None:
++            if kind in hits:
++                hits[kind] += 1
++            if not self.verbose:
++                return
++            if kind == "miss":
++                # On ne journalise que les calculs : lister les dizaines de
++                # nœuds servis par le cache noie le signal à chaque appel.
++                print(f"  ⟳ {n.name}:{n.key()[:8]}" + (f" [{n.label}]" if n.label else ""))
++
++        value = materialize(node, self.store, on_event)
++        if self.verbose:
++            print(
++                f"[{target}] {hits['done']} calculé(s), {hits['hit']} depuis le cache, "
++                f"{time.time() - t0:.1f}s"
++            )
++        return value
++
++    def deliver(self, targets: Sequence[str] = ("render", "exports")) -> list[str]:
++        """Recopie les livrables du cache vers `output/`.
++
++        Le cache est indexé par clé, donc illisible pour un humain : les
++        artefacts y vivent sous `render/<hash>/…`. Ce qu'on livre au monteur
++        doit atterrir à un endroit stable et nommable.
++        """
++        out_dir = Path(self.output_dir)
++        out_dir.mkdir(parents=True, exist_ok=True)
++        delivered: list[str] = []
++        for t in targets:
++            value = self.get(t)
++            for src in [value] if isinstance(value, str) else value:
++                dest = out_dir / Path(src).name
++                if Path(src).resolve() != dest.resolve():
++                    shutil.copy2(src, dest)
++                delivered.append(str(dest))
++        return delivered
++
++    # ── rapports ────────────────────────────────────────────────────────────
++
++    def report_candidates(self) -> str:
++        analysis = AnalysisResult.model_validate(self.get("segments"))
++        raw = self.get("candidates")
++        by_name = {p.name: p for p in self.presets}
++        lines = [f"{len(raw)} candidat(s) après déduplication\n"]
++        for c in (Candidate.model_validate(x) for x in raw):
++            lines.append(explain(c, analysis.segments, by_name[c.preset]))
++            lines.append("")
++        return "\n".join(lines)
++
++    def report_ranking(self) -> str:
++        r = self.get("ranked")
++        lines = [
++            f"Classement — {r['comparisons']} comparaison(s) par paires "
++            f"(aucune note absolue, aucun seuil)\n"
++        ]
++        for entry, plan in zip(r["ranked"], r["plans"]):
++            c = entry["candidate"]
++            tag = "→ LIVRÉ" if entry["rank"] == 0 else f"  alternate {entry['rank']}"
++            lines.append(
++                f"{tag}  {c['preset']}#{c['rank_in_preset']}  "
++                f"{len(plan['edits'])} plans · {plan['total_duration']:.1f}s · "
++                f"{entry['wins']} victoire(s)"
++            )
++            for n in entry["notes"][:1]:
++                lines.append(f"          {n}")
++        return "\n".join(lines)
++
++
++def run(
++    rush_paths: Sequence[str],
++    preset_names: Sequence[str],
++    *,
++    render: bool = True,
++    export: bool = True,
++    **kwargs,
++) -> Run:
++    r = Run(rush_paths, preset_names=preset_names, **kwargs)
++
++    print("\n── Graphe ──────────────────────────────────────────────")
++    print(r.plan("ranked"))
++    print(f"\n{len(r.todo('ranked'))} nœud(s) à calculer\n")
++
++    print("── Annotation ──────────────────────────────────────────")
++    r.get("segments")
++
++    print("\n── Assemblage (CP-SAT) ─────────────────────────────────")
++    print(r.report_candidates())
++
++    print("── Classement (comparaison par paires) ─────────────────")
++    print(r.report_ranking())
++
++    targets = tuple(t for t, on in (("exports", export), ("render", render)) if on)
++    if targets:
++        print("\n── Livrables ───────────────────────────────────────────")
++        for p in r.deliver(targets):
++            print(f"  {p}")
++
++    return r
+diff --git a/src/video/cuts.py b/src/video/cuts.py
+new file mode 100644
+index 0000000..b5067d5
+--- /dev/null
++++ b/src/video/cuts.py
+@@ -0,0 +1,81 @@
++"""Frames de raccord : la dernière image avant une coupe, la première après.
++
++Le CRITIC historique recevait 3 keyframes à 10/50/90 % du rendu — il ne voyait
++donc jamais une seule coupe, et jugeait le *contenu* en croyant juger le
++*montage*. Ici on échantillonne les raccords eux-mêmes, directement dans les
++rushes source : pas besoin d'avoir rendu la vidéo pour évaluer un plan.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++from src.models import EditPlan
++from src.video.thumbnails import extract_thumbnail, thumbnail_to_base64
++
++_EPS = 0.06  # recul/avance en secondes autour de la frontière
++
++
++def cut_times(plan: EditPlan, max_cuts: int = 4) -> list[tuple[int, str, float, str, float]]:
++    """(index_coupe, fichier_sortant, t_sortant, fichier_entrant, t_entrant)."""
++    edits = sorted(plan.edits, key=lambda e: e.order)
++    if len(edits) < 2:
++        return []
++
++    n_cuts = len(edits) - 1
++    if n_cuts <= max_cuts:
++        picks = list(range(n_cuts))
++    else:
++        step = n_cuts / max_cuts
++        picks = sorted({int(i * step) for i in range(max_cuts)})
++
++    out = []
++    for c in picks:
++        out_seg, in_seg = edits[c].segment, edits[c + 1].segment
++        t_out = max(out_seg.start_time, out_seg.end_time - _EPS)
++        t_in = min(in_seg.end_time, in_seg.start_time + _EPS)
++        out.append((c, out_seg.source_file, t_out, in_seg.source_file, t_in))
++    return out
++
++
++def cut_frame_paths(plan: EditPlan, tag: str, max_cuts: int = 4) -> list[tuple[int, str, str]]:
++    """Extrait les paires de frames de raccord. Renvoie (index, avant, après)."""
++    pairs: list[tuple[int, str, str]] = []
++    for c, f_out, t_out, f_in, t_in in cut_times(plan, max_cuts):
++        try:
++            before = extract_thumbnail(f_out, t_out, f"{tag}_cut{c:02d}_out", width=384)
++            after = extract_thumbnail(f_in, t_in, f"{tag}_cut{c:02d}_in", width=384)
++        except Exception as e:  # noqa: BLE001 — un raccord manquant n'invalide pas le plan
++            print(f"[CUTS] raccord {c} non extrait ({Path(f_out).name}): {e}")
++            continue
++        pairs.append((c, before, after))
++    return pairs
++
++
++def cut_vision_blocks(plan: EditPlan, tag: str, label: str, max_cuts: int = 4) -> list[dict]:
++    """Blocs `content` prêts pour l'API, montrant chaque raccord."""
++    blocks: list[dict] = []
++    for c, before, after in cut_frame_paths(plan, tag, max_cuts):
++        edits = sorted(plan.edits, key=lambda e: e.order)
++        blocks.append(
++            {
++                "type": "text",
++                "text": (
++                    f"\n**{label} — raccord {c + 1}** "
++                    f"({edits[c].segment.duration:.1f}s → {edits[c + 1].segment.duration:.1f}s, "
++                    f"transition « {edits[c + 1].transition_in} »). "
++                    "Image sortante puis image entrante :"
++                ),
++            }
++        )
++        for path in (before, after):
++            blocks.append(
++                {
++                    "type": "image",
++                    "source": {
++                        "type": "base64",
++                        "media_type": "image/jpeg",
++                        "data": thumbnail_to_base64(path),
++                    },
++                }
++            )
++    return blocks
+diff --git a/src/video/probe.py b/src/video/probe.py
+index b844837..b0eb12f 100644
+--- a/src/video/probe.py
++++ b/src/video/probe.py
+@@ -1,6 +1,7 @@
+ """Video metadata extraction and scene detection using embedded ffmpeg."""
+ from __future__ import annotations
+ import json
++import shutil
+ import subprocess
+ from pathlib import Path
+ 
+@@ -12,48 +13,76 @@ def _ffmpeg_exe() -> str:
+     return imageio_ffmpeg.get_ffmpeg_exe()
+ 
+ 
+-def _ffprobe_cmd(file_path: str) -> list[str]:
+-    """
+-    Build a probe command that works whether we have ffprobe or just ffmpeg.
+-    ffprobe and ffmpeg share the same binary family; ffmpeg exposes probe-style
+-    output via the same -show_streams / -print_format flags when invoked as ffprobe.
+-    imageio-ffmpeg ships only ffmpeg, so we use it with -hide_banner instead.
++def _ffprobe_cmd(file_path: str) -> list[str] | None:
++    """Commande ffprobe si un ffprobe est réellement disponible, sinon None.
++
++    ATTENTION : la version précédente prétendait que « ffmpeg expose la sortie
++    de type probe via les mêmes flags -show_streams / -print_format ». C'est
++    faux — ffmpeg répond `Unrecognized option 'print_format'`. Or imageio-ffmpeg
++    n'embarque QUE ffmpeg (c'est tout l'argument du « pas besoin d'installer
++    ffmpeg »), donc sur une installation propre cette branche échouait toujours
++    et chaque probe retombait en silence sur moviepy, qui ouvre un
++    VideoFileClip complet juste pour lire une durée. On préfère désormais les
++    métadonnées d'imageio-ffmpeg, qui ne demandent aucun ffprobe.
+     """
+     ffmpeg = _ffmpeg_exe()
+-    # Try ffprobe next to ffmpeg first
+-    ffprobe = Path(ffmpeg).parent / "ffprobe.exe"
+-    if not ffprobe.exists():
+-        ffprobe = Path(ffmpeg).parent / "ffprobe"
+-    if ffprobe.exists():
+-        return [str(ffprobe), "-v", "quiet", "-print_format", "json",
+-                "-show_streams", "-show_format", file_path]
+-    # Fallback: use ffmpeg's built-in probe capability
+-    # ffmpeg supports -hide_banner -v quiet -print_format json -show_streams
+-    # via the same libavformat infrastructure
+-    return [ffmpeg, "-hide_banner", "-v", "quiet", "-print_format", "json",
+-            "-show_streams", "-show_format", file_path]
++    for candidate in (
++        Path(ffmpeg).parent / "ffprobe.exe",
++        Path(ffmpeg).parent / "ffprobe",
++        Path(shutil.which("ffprobe") or "/nonexistent"),
++    ):
++        if candidate.exists():
++            return [
++                str(candidate), "-v", "quiet", "-print_format", "json",
++                "-show_streams", "-show_format", file_path,
++            ]
++    return None
++
++
++def _probe_with_imageio(file_path: str) -> VideoMetadata:
++    """Métadonnées via imageio-ffmpeg : pas de ffprobe, pas de moviepy."""
++    import imageio_ffmpeg
++
++    reader = imageio_ffmpeg.read_frames(file_path)
++    try:
++        meta = next(reader)
++    finally:
++        reader.close()
++
++    width, height = meta.get("size", (0, 0))
++    return VideoMetadata(
++        file_path=file_path,
++        duration=float(meta.get("duration", 0.0) or 0.0),
++        fps=float(meta.get("fps", 25.0) or 25.0),
++        width=int(width),
++        height=int(height),
++        has_audio=meta.get("audio_codec") is not None,
++        codec=str(meta.get("codec", "unknown")),
++        file_size_bytes=Path(file_path).stat().st_size,
++    )
+ 
+ 
+ def probe_video(file_path: str) -> VideoMetadata:
+     """Extract technical metadata from a video file."""
+     cmd = _ffprobe_cmd(file_path)
+-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
++    if cmd is None:
++        return _probe_with_imageio(file_path)
+ 
++    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+     if result.returncode != 0 or not result.stdout.strip():
+-        # Final fallback: use moviepy to get basic info
+-        return _probe_with_moviepy(file_path)
++        return _probe_with_imageio(file_path)
+ 
+     try:
+         data = json.loads(result.stdout)
+     except json.JSONDecodeError:
+-        return _probe_with_moviepy(file_path)
++        return _probe_with_imageio(file_path)
+ 
+     video_stream = next((s for s in data.get("streams", []) if s["codec_type"] == "video"), None)
+     audio_stream = next((s for s in data.get("streams", []) if s["codec_type"] == "audio"), None)
+     fmt = data.get("format", {})
+ 
+     if not video_stream:
+-        return _probe_with_moviepy(file_path)
++        return _probe_with_imageio(file_path)
+ 
+     fps_raw = video_stream.get("r_frame_rate", "25/1")
+     num, den = fps_raw.split("/")
+@@ -75,7 +104,7 @@ def probe_video(file_path: str) -> VideoMetadata:
+ 
+ 
+ def _probe_with_moviepy(file_path: str) -> VideoMetadata:
+-    """Fallback: extract metadata using moviepy (which uses embedded ffmpeg)."""
++    """Dernier recours historique. Conservé, mais plus sur le chemin nominal."""
+     import os
+     os.environ.setdefault("IMAGEIO_FFMPEG_EXE", _ffmpeg_exe())
+     from moviepy import VideoFileClip
+diff --git a/tests/fixtures/README.md b/tests/fixtures/README.md
+new file mode 100644
+index 0000000..4395805
+--- /dev/null
++++ b/tests/fixtures/README.md
+@@ -0,0 +1,31 @@
++# Fixtures vidéo
++
++`rushes/` contient trois clips de 24 s générés par ffmpeg (8 scènes de 3 s
++chacune, motifs et teintes distincts pour que la détection de scènes se
++déclenche). Ils servent aux tests de bout en bout dans `test_pipeline_e2e.py`,
++qui vérifient la sémantique du cache, l'export NLE et le rendu.
++
++Les régénérer :
++
++```bash
++for i in 0 1 2; do
++  : > /tmp/list_$i.txt
++  for s in 0 1 2 3 4 5 6 7; do
++    n=$(( i*8 + s ))
++    case $(( n % 4 )) in
++      0) SRC="testsrc=size=320x180:rate=25:duration=3";;
++      1) SRC="smptebars=size=320x180:rate=25:duration=3";;
++      2) SRC="testsrc2=size=320x180:rate=25:duration=3";;
++      3) SRC="rgbtestsrc=size=320x180:rate=25:duration=3";;
++    esac
++    ffmpeg -y -loglevel error -f lavfi -i "$SRC" \
++      -vf "drawtext=text='R${i}S${s}':fontsize=44:x=10:y=10,hue=h=$(( n * 43 ))" \
++      -c:v libx264 -pix_fmt yuv420p -g 12 /tmp/p_${i}_${s}.mp4
++    echo "file '/tmp/p_${i}_${s}.mp4'" >> /tmp/list_$i.txt
++  done
++  ffmpeg -y -loglevel error -f concat -safe 0 -i /tmp/list_$i.txt -c copy \
++    tests/fixtures/rushes/rush_$i.mp4
++done
++```
++
++Les tests se skippent proprement si le dossier est vide.
+diff --git a/tests/test_assemble.py b/tests/test_assemble.py
+new file mode 100644
+index 0000000..56f283b
+--- /dev/null
++++ b/tests/test_assemble.py
+@@ -0,0 +1,155 @@
++"""Le solveur : les contraintes déclarées sont réellement respectées.
++
++C'est l'intérêt principal du passage à CP-SAT : ce sont des propriétés
++testables, contrairement à « le prompt demande de varier les durées ».
++"""
++from __future__ import annotations
++
++import random
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.assemble import (  # noqa: E402
++    DEFAULT_BEAM,
++    PRESETS,
++    Preset,
++    solve,
++    to_edit_plan,
++)
++from src.models import VideoSegment  # noqa: E402
++
++ROLES = ["opening", "build_up", "climax", "resolution", "outro", "b_roll"]
++EMOTIONS = ["energetic", "joyful", "tense", "neutral", "calm", "melancholic"]
++
++# Budget court : ces tests vérifient des invariants, pas l'optimalité.
++BUDGET = 3.0
++
++
++def fixture(n_files: int = 4, per_file: int = 18, seed: int = 7) -> list[VideoSegment]:
++    rng = random.Random(seed)
++    segs: list[VideoSegment] = []
++    for f in range(n_files):
++        t = 0.0
++        for _ in range(per_file):
++            d = rng.uniform(1.0, 9.0)
++            segs.append(
++                VideoSegment(
++                    source_file=f"rush_{f}.mp4",
++                    start_time=t,
++                    end_time=t + d,
++                    duration=d,
++                    quality_score=round(rng.uniform(0.2, 0.95), 2),
++                    semantic_tags=["b_roll"],
++                    emotion=rng.choice(EMOTIONS),
++                    suggested_role=rng.choice(ROLES),
++                )
++            )
++            t += d + rng.uniform(0.2, 2.0)
++    return segs
++
++
++SEGS = fixture()
++
++
++def test_duration_within_tolerance():
++    for name in DEFAULT_BEAM:
++        p = PRESETS[name]
++        for c in solve(SEGS, p, k=1, time_limit_s=BUDGET):
++            lo = p.target_duration * (1 - p.tolerance)
++            hi = p.target_duration * (1 + p.tolerance)
++            assert lo <= c.duration <= hi, f"{name}: {c.duration:.1f}s hors [{lo}, {hi}]"
++
++
++def test_no_segment_used_twice():
++    for name in DEFAULT_BEAM:
++        for c in solve(SEGS, PRESETS[name], k=1, time_limit_s=BUDGET):
++            idx = [p.index for p in c.picks]
++            assert len(idx) == len(set(idx)), f"{name}: segment répété"
++
++
++def test_no_same_source_adjacent():
++    p = PRESETS["emotional_arc"]
++    assert p.forbid_same_source_adjacent
++    for c in solve(SEGS, p, k=1, time_limit_s=BUDGET):
++        srcs = [SEGS[pick.index].source_file for pick in c.picks]
++        assert all(a != b for a, b in zip(srcs, srcs[1:])), "deux plans de suite du même rush"
++
++
++def test_shot_length_bounds():
++    for name in DEFAULT_BEAM:
++        p = PRESETS[name]
++        for c in solve(SEGS, p, k=1, time_limit_s=BUDGET):
++            for pick in c.picks:
++                d = pick.end - pick.start
++                assert d <= p.max_shot + 1e-6, f"{name}: plan de {d:.2f}s > max {p.max_shot}"
++                assert d >= p.min_shot - 1e-6, f"{name}: plan de {d:.2f}s < min {p.min_shot}"
++
++
++def test_chronology_preset_is_chronological():
++    p = PRESETS["chronological"]
++    # L'instance la plus dure du faisceau : l'ordre strict couple toutes les
++    # positions entre elles, là où les autres presets se décomposent bien.
++    cands = solve(SEGS, p, k=1, time_limit_s=12.0)
++    assert cands, "le preset chronologique doit produire une solution"
++    for c in cands:
++        keys = [(SEGS[pick.index].source_file, SEGS[pick.index].start_time) for pick in c.picks]
++        assert keys == sorted(keys), "l'ordre chronologique n'est pas respecté"
++
++
++def test_opening_first_and_closing_last():
++    p = PRESETS["emotional_arc"]
++    for c in solve(SEGS, p, k=1, time_limit_s=BUDGET):
++        assert SEGS[c.picks[0].index].suggested_role == "opening"
++        assert SEGS[c.picks[-1].index].suggested_role in ("resolution", "outro")
++
++
++def test_k_best_are_distinct():
++    cands = solve(SEGS, PRESETS["emotional_arc"], k=3, min_diff=3, time_limit_s=BUDGET)
++    assert len(cands) >= 2, "le solveur doit énumérer plusieurs solutions"
++    sels = [c.selection for c in cands]
++    for i in range(len(sels)):
++        for j in range(i + 1, len(sels)):
++            assert len(sels[i] ^ sels[j]) >= 3, "solutions trop proches (no-good inopérant)"
++
++
++def test_ranked_by_objective():
++    cands = solve(SEGS, PRESETS["punchy"], k=3, time_limit_s=BUDGET)
++    objs = [c.objective for c in cands]
++    assert objs == sorted(objs, reverse=True)
++    assert [c.rank_in_preset for c in cands] == list(range(len(cands)))
++
++
++def test_deterministic():
++    """Même entrée, même sortie : rejouable, contrairement à un plan de LLM."""
++    a = solve(SEGS, PRESETS["contemplative"], k=1, time_limit_s=BUDGET)
++    b = solve(SEGS, PRESETS["contemplative"], k=1, time_limit_s=BUDGET)
++    assert [p.index for p in a[0].picks] == [p.index for p in b[0].picks]
++
++
++def test_to_edit_plan_roundtrip():
++    p = PRESETS["emotional_arc"]
++    c = solve(SEGS, p, k=1, time_limit_s=BUDGET)[0]
++    plan = to_edit_plan(c, SEGS, p)
++    assert [e.order for e in plan.edits] == list(range(len(plan.edits)))
++    assert abs(plan.total_duration - c.duration) < 1e-6
++    assert plan.edits[0].transition_in == "fade"
++    # Les bornes du plan sont dans les bornes réelles des segments source.
++    for e in plan.edits:
++        src = next(s for s in SEGS if s.source_file == e.segment.source_file
++                   and s.start_time <= e.segment.start_time + 1e-6
++                   and s.end_time >= e.segment.end_time - 1e-6)
++        assert src is not None
++
++
++def test_infeasible_returns_empty_not_garbage():
++    tight = Preset(name="impossible", target_duration=600, tolerance=0.0, min_shot=1.0, max_shot=2.0)
++    assert solve(SEGS[:5], tight, k=1, time_limit_s=5) == []
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++            print(f"ok  {name}")
+diff --git a/tests/test_beam.py b/tests/test_beam.py
+new file mode 100644
+index 0000000..68d6fab
+--- /dev/null
++++ b/tests/test_beam.py
+@@ -0,0 +1,98 @@
++"""Le faisceau et le classement, avec un comparateur factice (zéro appel API)."""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src import beam  # noqa: E402
++from src.assemble import Candidate, Pick  # noqa: E402
++
++
++def cand(preset: str, rank: int, obj: int, indices: list[int]) -> Candidate:
++    return Candidate(
++        preset=preset,
++        rank_in_preset=rank,
++        objective=obj,
++        bound=obj,
++        status="OPTIMAL",
++        picks=[Pick(index=i, start=0.0, end=2.0) for i in indices],
++    )
++
++
++def test_dedupe_drops_near_identical():
++    a = cand("p1", 0, 100, [1, 2, 3, 4, 5])
++    b = cand("p2", 0, 90, [1, 2, 3, 4, 6])  # Jaccard 4/6 = 0.67
++    c = cand("p3", 0, 80, [1, 2, 3, 4, 5])  # identique à a
++    kept = beam.dedupe([a, b, c], threshold=0.85)
++    assert len(kept) == 2 and kept[0] is a and kept[1] is b
++
++
++def test_prefilter_never_compares_objectives_across_presets():
++    """Deux presets = deux fonctions objectif : leurs valeurs ne sont pas
++    comparables. Le pré-filtre doit garder le meilleur *par* preset."""
++    weak_preset_best = cand("contemplative", 0, 5, [1, 2, 3])
++    strong_preset_worse = cand("punchy", 1, 900, [4, 5, 6])
++    strong_preset_best = cand("punchy", 0, 1000, [7, 8, 9])
++    kept = beam.objective_prefilter(
++        [weak_preset_best, strong_preset_worse, strong_preset_best], per_preset=1
++    )
++    presets = {c.preset for c in kept}
++    assert presets == {"contemplative", "punchy"}
++    assert weak_preset_best in kept, "un preset à faible objectif ne doit pas être éliminé"
++    assert strong_preset_worse not in kept
++
++
++def test_rank_orders_by_fake_comparator():
++    """Comparateur factice : le candidat au plus grand nombre de picks gagne."""
++    cands = [cand(f"p{i}", 0, 0, list(range(i + 2))) for i in range(5)]
++    calls = {"n": 0}
++
++    def cmp(a: Candidate, b: Candidate) -> tuple[str, str]:
++        calls["n"] += 1
++        return ("A" if len(a.picks) > len(b.picks) else "B", "factice")
++
++    ranked, n = beam.rank(cands, cmp)
++    assert [len(r.candidate.picks) for r in ranked] == [6, 5, 4, 3, 2]
++    assert n == calls["n"] and n <= 12, f"trop de comparaisons: {n}"
++
++
++def test_rank_memoizes_pairs():
++    cands = [cand(f"p{i}", 0, 0, [i]) for i in range(4)]
++    seen: list[tuple[int, int]] = []
++
++    def cmp(a: Candidate, b: Candidate) -> tuple[str, str]:
++        seen.append((a.picks[0].index, b.picks[0].index))
++        return ("A", "")
++
++    beam.rank(cands, cmp)
++    norm = {tuple(sorted(p)) for p in seen}
++    assert len(norm) == len(seen), "une paire a été comparée deux fois"
++
++
++def test_orientation_is_stable_and_mixed():
++    """L'ordre de présentation est déterministe (rejouable) mais ne s'aligne
++    pas sur un preset — sinon le biais de position du LLM le favorise."""
++    pool = [cand(f"preset_{i}", 0, 0, [i]) for i in range(12)]
++    orientations = [beam._orientation(pool[0], p) for p in pool[1:]]
++    assert beam._orientation(pool[0], pool[1]) is beam._orientation(pool[0], pool[1])
++    assert len(set(orientations)) == 2, "orientation constante = biais systématique"
++
++
++def test_rank_handles_single_candidate():
++    ranked, n = beam.rank([cand("p", 0, 0, [1])], lambda a, b: ("A", ""))
++    assert len(ranked) == 1 and n == 0
++
++
++def test_rank_caps_candidate_count():
++    cands = [cand(f"p{i}", 0, 0, [i]) for i in range(20)]
++    ranked, _ = beam.rank(cands, lambda a, b: ("A", ""), max_candidates=6)
++    assert len(ranked) == 6
++
++
++if __name__ == "__main__":
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            fn()
++            print(f"ok  {name}")
+diff --git a/tests/test_graph.py b/tests/test_graph.py
+new file mode 100644
+index 0000000..6d38d50
+--- /dev/null
++++ b/tests/test_graph.py
+@@ -0,0 +1,132 @@
++"""Le graphe : clés stables, cache, invalidation sélective.
++
++Aucune clé API, aucun fichier vidéo — ces tests tournent en CI.
++"""
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.graph import Node, Store, materialize, stale  # noqa: E402
++
++
++def _counter():
++    calls: dict[str, int] = {}
++
++    def bump(name: str):
++        calls[name] = calls.get(name, 0) + 1
++
++    return calls, bump
++
++
++def build(tmp: Path, target: int, scale: int = 2):
++    calls, bump = _counter()
++
++    def raw():
++        bump("raw")
++        return [1, 2, 3]
++
++    def scaled(base, factor):
++        bump("scaled")
++        return [b * factor for b in base]
++
++    def plan(values, target):
++        bump("plan")
++        return {"sum": sum(values), "target": target}
++
++    a = Node("raw", raw)
++    b = Node("scaled", scaled, {"base": a}, params={"factor": scale})
++    c = Node("plan", plan, {"values": b}, params={"target": target})
++    return c, calls
++
++
++def test_cache_hit_avoids_recompute(tmp_path):
++    store = Store(tmp_path)
++    node, calls = build(tmp_path, target=60)
++    assert materialize(node, store) == {"sum": 12, "target": 60}
++    assert calls == {"raw": 1, "scaled": 1, "plan": 1}
++
++    node2, calls2 = build(tmp_path, target=60)
++    assert materialize(node2, store) == {"sum": 12, "target": 60}
++    assert calls2 == {}, "tout devait venir du cache"
++
++
++def test_param_change_invalidates_only_downstream(tmp_path):
++    """Le cœur de l'affaire : changer la durée cible ne réanalyse rien en amont."""
++    store = Store(tmp_path)
++    node, _ = build(tmp_path, target=60)
++    materialize(node, store)
++
++    node2, calls2 = build(tmp_path, target=90)
++    materialize(node2, store)
++    assert calls2 == {"plan": 1}, "seul le plan devait être recalculé"
++
++
++def test_upstream_change_invalidates_downstream(tmp_path):
++    store = Store(tmp_path)
++    node, _ = build(tmp_path, target=60, scale=2)
++    materialize(node, store)
++
++    node2, calls2 = build(tmp_path, target=60, scale=3)
++    materialize(node2, store)
++    assert calls2 == {"scaled": 1, "plan": 1}
++    assert "raw" not in calls2
++
++
++def test_version_bump_invalidates(tmp_path):
++    store = Store(tmp_path)
++    n1 = Node("f", lambda: 1, version="1")
++    materialize(n1, store)
++    n2 = Node("f", lambda: 2, version="2")
++    assert materialize(n2, store) == 2, "le bump de version doit forcer le recalcul"
++
++
++def test_stale_reports_what_is_missing(tmp_path):
++    store = Store(tmp_path)
++    node, _ = build(tmp_path, target=60)
++    assert {n.name for n in stale(node, store)} == {"raw", "scaled", "plan"}
++    materialize(node, store)
++    assert stale(node, store) == []
++
++
++def test_resume_after_crash(tmp_path):
++    """Un plantage en aval ne perd pas le travail amont — la reprise est
++    une propriété du cache, pas une feature à écrire."""
++    store = Store(tmp_path)
++    calls, bump = _counter()
++
++    def heavy():
++        bump("heavy")
++        return list(range(5))
++
++    def boom(values):
++        bump("boom")
++        raise RuntimeError("plantage simulé")
++
++    a = Node("heavy", heavy)
++    b = Node("boom", boom, {"values": a})
++    try:
++        materialize(b, store)
++    except RuntimeError:
++        pass
++    assert calls["heavy"] == 1
++
++    def fixed(values):
++        bump("fixed")
++        return sum(values)
++
++    b2 = Node("boom", fixed, {"values": Node("heavy", heavy)}, version="2")
++    assert materialize(b2, store) == 10
++    assert calls["heavy"] == 1, "le nœud coûteux ne devait pas être recalculé"
++
++
++if __name__ == "__main__":
++    import tempfile
++
++    for name, fn in sorted(globals().items()):
++        if name.startswith("test_"):
++            with tempfile.TemporaryDirectory() as d:
++                fn(Path(d))
++            print(f"ok  {name}")
+diff --git a/tests/test_pipeline_e2e.py b/tests/test_pipeline_e2e.py
+new file mode 100644
+index 0000000..35daa59
+--- /dev/null
++++ b/tests/test_pipeline_e2e.py
+@@ -0,0 +1,211 @@
++"""Bout en bout du moteur graphe, LLM simulés.
++
++Couvre ce que les tests unitaires ne touchaient pas : détection de scènes,
++vignettes, fusion en AnalysisResult, appel du solveur depuis un nœud, classement,
++export EDL/FCPXML, rendu moviepy — et surtout la sémantique du cache
++(qu'est-ce qui est réellement invalidé quand on change quoi).
++
++Les deux agents LLM sont remplacés par des doubles déterministes : ces tests
++tournent sans ANTHROPIC_API_KEY. Ils exigent en revanche ffmpeg et moviepy, et
++sont donc marqués `slow`.
++"""
++from __future__ import annotations
++
++import hashlib
++import sys
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src import beam, nodes  # noqa: E402
++from src.agents.annotator import SegmentSemantics  # noqa: E402
++from src.assemble import Candidate  # noqa: E402
++
++RUSHES_DIR = Path(__file__).parent / "fixtures" / "rushes"
++pytestmark = pytest.mark.skipif(
++    not RUSHES_DIR.is_dir() or not list(RUSHES_DIR.glob("*.mp4")),
++    reason="fixtures vidéo absentes — voir tests/fixtures/README.md",
++)
++
++ROLES = ["opening", "build_up", "climax", "resolution", "outro", "b_roll"]
++EMOTIONS = ["energetic", "joyful", "tense", "neutral", "calm", "melancholic"]
++
++
++def fake_annotate(rush: str, scenes, thumbs, model: str) -> list[dict]:
++    """Double de l'ANNOTATOR : dérivé du hash, donc stable d'un run à l'autre.
++
++    Un double non déterministe rendrait le cache menteur — c'est exactement la
++    propriété qu'on veut vérifier ici.
++    """
++    out = []
++    for i, (s, e) in enumerate(scenes):
++        h = hashlib.sha256(f"{Path(rush).name}:{i}".encode()).digest()
++        out.append(
++            SegmentSemantics(
++                segment_index=i,
++                quality_score=round(0.2 + (h[0] / 255) * 0.75, 2),
++                semantic_tags=["b_roll"],
++                emotion=EMOTIONS[h[1] % len(EMOTIONS)],
++                suggested_role=ROLES[h[2] % len(ROLES)],
++                include_recommendation=True,
++            ).model_dump(mode="json")
++        )
++    return out
++
++
++def fake_rank(analysis, candidates, presets, model, max_candidates, per_preset):
++    """Double du COMPARATOR : préfère le candidat au plus grand nombre de plans."""
++    from src.assemble import Preset, to_edit_plan
++    from src.models import AnalysisResult
++
++    segs = AnalysisResult.model_validate(analysis).segments
++    preset_map = {p["name"]: Preset.model_validate(p) for p in presets}
++    cands = beam.objective_prefilter(
++        [Candidate.model_validate(c) for c in candidates], per_preset=per_preset
++    )
++    ranked, calls = beam.rank(
++        cands,
++        lambda a, b: ("A" if len(a.picks) > len(b.picks) else "B", "double"),
++        max_candidates=max_candidates,
++    )
++    return {
++        "comparisons": calls,
++        "ranked": [r.model_dump(mode="json") for r in ranked],
++        "plans": [
++            to_edit_plan(
++                r.candidate, segs, preset_map[r.candidate.preset],
++                title=f"{r.rank + 1:02d}_{r.candidate.preset}",
++            ).model_dump(mode="json")
++            for r in ranked
++        ],
++    }
++
++
++@pytest.fixture
++def stubbed(monkeypatch):
++    monkeypatch.setattr(nodes, "_annot", fake_annotate)
++    monkeypatch.setattr(nodes, "_ranked", fake_rank)
++
++
++@pytest.fixture
++def make_run(tmp_path, stubbed):
++    from src.pipeline import Run
++
++    def _make(**kw):
++        return Run(
++            [str(p) for p in sorted(RUSHES_DIR.glob("*.mp4"))],
++            preset_names=kw.pop("preset_names", ["punchy", "best_of"]),
++            target_duration=kw.pop("target_duration", 20.0),
++            max_segments_per_rush=kw.pop("max_segments_per_rush", 8),
++            solver_time_limit_s=kw.pop("solver_time_limit_s", 5.0),
++            cache_dir=tmp_path / "cache",
++            output_dir=tmp_path / "out",
++            verbose=False,
++            **kw,
++        )
++
++    return _make
++
++
++def test_segments_are_built_from_real_video(make_run):
++    from src.models import AnalysisResult
++
++    r = make_run()
++    analysis = AnalysisResult.model_validate(r.get("segments"))
++    assert len(analysis.segments) >= 12
++    for s in analysis.segments:
++        assert s.end_time > s.start_time
++        assert Path(s.thumbnail_path).exists(), "vignette non matérialisée"
++        assert 0.0 <= s.quality_score <= 1.0
++
++
++def test_plan_bounds_stay_inside_source_media(make_run):
++    """Le clamp anti-hallucination du dépôt vaut aussi pour le solveur."""
++    from src.models import AnalysisResult, EditPlan
++    from src.video.probe import probe_video
++
++    r = make_run()
++    analysis = AnalysisResult.model_validate(r.get("segments"))
++    durations = {s.source_file: probe_video(s.source_file).duration for s in analysis.segments}
++    for raw in r.get("ranked")["plans"]:
++        for e in EditPlan.model_validate(raw).edits:
++            assert e.segment.start_time >= 0.0
++            assert e.segment.end_time <= durations[e.segment.source_file] + 1e-6
++
++
++def test_second_run_is_a_full_cache_hit(make_run):
++    r1 = make_run()
++    r1.get("ranked")
++    r2 = make_run()
++    assert r2.todo("ranked") == [], "un run identique doit tout retrouver en cache"
++
++
++def test_changing_duration_spares_the_vision_nodes(make_run):
++    """L'argument central du graphe : la vision est le poste de coût, et
++    changer un paramètre de montage ne doit pas la refaire."""
++    r1 = make_run(target_duration=20.0)
++    r1.get("ranked")
++
++    r2 = make_run(target_duration=24.0)
++    names = {n.name for n in r2.todo("ranked")}
++    assert names == {"candidates", "ranked"}
++    assert "annot" not in names and "thumbs" not in names and "scenes" not in names
++
++
++def test_adding_a_rush_spares_the_other_rushes(make_run, tmp_path):
++    import shutil
++
++    r1 = make_run()
++    r1.get("segments")
++
++    extra_dir = tmp_path / "more"
++    extra_dir.mkdir()
++    files = sorted(RUSHES_DIR.glob("*.mp4"))
++    for f in files:
++        shutil.copy2(f, extra_dir / f.name)
++    shutil.copy2(files[0], extra_dir / "rush_extra.mp4")
++
++    from src.pipeline import Run
++
++    r2 = Run(
++        [str(p) for p in sorted(extra_dir.glob("*.mp4"))],
++        preset_names=["punchy", "best_of"],
++        target_duration=20.0,
++        max_segments_per_rush=8,
++        solver_time_limit_s=5.0,
++        cache_dir=tmp_path / "cache",
++        output_dir=tmp_path / "out",
++        verbose=False,
++    )
++    todo = [n for n in r2.todo("segments")]
++    # Le nouveau fichier a un chemin distinct donc ses nœuds sont neufs ;
++    # les rushes déjà vus ne sont PAS réanalysés (même empreinte de contenu).
++    assert sum(1 for n in todo if n.name == "annot") <= 2, [str(n) for n in todo]
++
++
++def test_exports_and_render_produce_real_files(make_run):
++    r = make_run()
++    exports = r.get("exports")
++    # EDL + FCPXML + le plan JSON, qui est l'entrée de `python -m src.export_resolve`.
++    assert len(exports) == 3
++    assert {Path(p).suffix.lower() for p in exports} == {".edl", ".fcpxml", ".json"}
++    for p in exports:
++        assert Path(p).stat().st_size > 0
++
++    edl = next(p for p in exports if p.endswith(".edl"))
++    assert "CMX" in Path(edl).read_text() or "TITLE" in Path(edl).read_text()
++
++    out = r.get("render")
++    assert Path(out).exists() and Path(out).stat().st_size > 10_000
++
++
++def test_render_duration_matches_the_plan(make_run):
++    from src.models import EditPlan
++    from src.video.probe import probe_video
++
++    r = make_run()
++    plan = EditPlan.model_validate(r.get("ranked")["plans"][0])
++    actual = probe_video(r.get("render")).duration
++    assert abs(actual - plan.total_duration) < 1.0, f"{actual}s rendu vs {plan.total_duration}s planifié"

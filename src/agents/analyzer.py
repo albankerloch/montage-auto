@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from src.agents.base_agent import BaseAgent
 from src.config import ANALYZER_MODEL, MAX_SEGMENTS_PER_RUSH, TARGET_MONTAGE_DURATION
+from src.agents.annotator import SegmentSemantics  # contrat partagé avec le moteur graphe
 from src.models import AnalysisResult, VideoSegment
 from src.video.probe import probe_video, detect_scenes
 from src.video.thumbnails import extract_thumbnail, build_vision_content
@@ -21,16 +22,6 @@ For each video segment shown, analyze:
 
 Be critical and honest. Prioritize high-quality, visually interesting segments.
 Return your analysis for ALL segments shown."""
-
-
-class SegmentSemantics(BaseModel):
-    segment_index: int
-    quality_score: float
-    semantic_tags: list[str]
-    emotion: str
-    suggested_role: str
-    include_recommendation: bool
-    notes: str
 
 
 class SemanticAnalysisResult(BaseModel):
@@ -109,6 +100,17 @@ class AnalyzerAgent(BaseAgent):
             batch_semantics = self._analyze_batch(batch, batch_start, total_duration)
             all_semantics.extend(batch_semantics)
             overall_summaries.append(f"Batch {batch_start // _BATCH_SIZE + 1}: {len(batch)} segments analyzed")
+
+        # Garde d'alignement. Sans elle, un batch qui renvoie moins d'analyses
+        # que d'images décale TOUS les segments suivants : la note et l'émotion
+        # d'un plan sont attribuées à un autre, silencieusement. Le moteur graphe
+        # (`--engine graph`) reprend le batch image par image ; ici on échoue.
+        if len(all_semantics) != len(valid_pairs):
+            raise RuntimeError(
+                f"Désalignement analyses/segments : {len(all_semantics)} pour "
+                f"{len(valid_pairs)} vignettes. Utiliser --engine graph, qui "
+                f"reprend le batch unitairement au lieu de deviner l'appariement."
+            )
 
         # Merge technical + semantic data
         for i, (seg_dict, thumb_path) in enumerate(valid_pairs):

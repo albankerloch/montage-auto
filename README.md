@@ -230,9 +230,112 @@ Les paramètres principaux sont dans `src/config.py` :
 
 ---
 
+## Deux moteurs
+
+Le dépôt embarque deux implémentations du même problème. La première est
+l'originale ; la seconde est ce vers quoi elle a convergé une fois admis que
+l'essentiel de ce qu'on demandait au LLM était un problème d'optimisation sous
+contraintes, et que la boucle de révision était une recherche dégradée
+(faisceau de 1, récompense scalaire bruitée, aucune garantie de monotonie).
+
+| | `--engine loop` (historique) | `--engine graph` (défaut) |
+|---|---|---|
+| Ordonnancement | machine à états écrite à la main | graphe de dépendances, remonté à la demande |
+| Assemblage | SCENARIO (LLM) écrit la timeline | CP-SAT sous contraintes déclarées |
+| Exploration | boucle CRITIC → REVISION, séquentielle | faisceau de N intentions, indépendantes |
+| Évaluation | score absolu 0–1 contre un seuil de 0.70 | comparaison par paires, sans calibration |
+| Sortie | un montage | un classement : livré + alternates |
+| Reprise | aucune | propriété du cache |
+| Rejouabilité | non | oui (solveur déterministe) |
+
+```bash
+python -m src.main rushes/ --engine graph
+python -m src.main rushes/ --engine graph --presets punchy,emotional_arc --duration 90
+python -m src.main rushes/ --engine graph --explain   # que recalculerait-on ?
+python -m src.main rushes/ --engine loop --max-iter 3 # ancien comportement
+```
+
+### Le graphe (`src/graph.py`, `src/nodes.py`)
+
+On ne décrit aucun ordre d'exécution, seulement qui dépend de quoi. Chaque nœud
+porte une clé `sha256(nom + version + params + clés des dépendances)` ; demander
+un artefact matérialise ce qui manque.
+
+```
+rush ─┬─ probe ──────────────┐
+      ├─ scenes ─┬─ thumbs ──┼─ annot ─┐
+      └──────────┘           │         │
+                             └─────────┴─ segments ─ candidates ─ ranked ─┬─ render
+                                                                          └─ exports
+```
+
+Les nœuds par rush sont indépendants entre rushes. Conséquences vérifiées par
+`tests/test_pipeline_e2e.py` :
+
+- ajouter un rush ne réanalyse que ce rush ;
+- passer la durée cible de 60 à 90 s n'invalide que `candidates` et l'aval —
+  jamais les annotations vision, qui sont le poste de coût ;
+- un plantage en aval ne perd pas le travail amont ;
+- `--explain` affiche le graphe et ce qui serait recalculé.
+
+Le corps des fonctions n'est **pas** haché : c'est `V[...]` dans `src/nodes.py`
+qui déclare qu'un calcul a changé de sémantique, comme une migration. Et le
+cache impose le déterminisme : un nœud non déterministe rend la valeur relue
+différente d'un recalcul, ce qui est la raison pour laquelle le solveur tourne
+sur un worker avec une limite en temps déterministe.
+
+### Le solveur (`src/assemble.py`)
+
+Le LLM annote (`quality_score`, rôle, émotion). Le solveur sélectionne et
+ordonne : `x[i][p] = 1` si le segment `i` occupe la position `p`.
+
+Contraintes dures : durée dans la bande de tolérance, chaque segment au plus une
+fois, positions contiguës, pas deux plans adjacents du même rush, plan
+d'ouverture en tête, résolution en queue, ordre chronologique optionnel.
+Objectif : qualité, adéquation rôle/position, écart à une courbe d'énergie,
+écart au rythme cible, moins un péage par plan (sans lui, une somme de scores
+positifs veut toujours plus de plans et sature le plafond de durée).
+
+Chaque contrainte est testable et se discute avec un monteur, contrairement à un
+prompt de 400 mots. `Candidate.gap` expose l'écart à la borne supérieure : on
+sait ce qu'on ne sait pas.
+
+### Le faisceau (`src/beam.py`)
+
+Cinq intentions — `chronological`, `emotional_arc`, `punchy`, `contemplative`,
+`best_of` — sont des `Preset`, pas des prompts : générer le faisceau coûte zéro
+token et les solveurs sont indépendants. Le solveur énumère K solutions
+distinctes par intention (no-good de diversité), on déduplique au Jaccard, puis
+on classe par comparaison par paires.
+
+Le comparateur reçoit les **frames de raccord** (`src/video/cuts.py`) : la
+dernière image avant chaque coupe et la première après. L'ancien CRITIC recevait
+trois keyframes à 10/50/90 % du rendu — il ne voyait donc jamais une seule
+coupe, et jugeait le contenu en croyant juger le montage.
+
+## Tests
+
+```bash
+pip install pytest && python -m pytest tests -q
+```
+
+31 tests, sans clé API. Les tests de bout en bout utilisent des doubles
+déterministes pour les deux agents LLM et des fixtures vidéo générées par
+ffmpeg ; ils se skippent si `tests/fixtures/rushes/` est vide.
+
+---
+
 ## Limites (POC)
 
-- Le CRITIC évalue le **plan** et des **keyframes** statiques, pas la vidéo en temps réel
+- Le comparateur juge des images fixes de raccord, pas le mouvement : un faux
+  raccord sur un travelling lui échappe encore
+- Aucune notion de multicam (synchro, choix d'angle sur action simultanée)
+- Le coût et la latence ne sont pas instrumentés : `response.usage` n'est lu
+  nulle part, donc aucun chiffre de bout en bout n'est disponible
 - Les rushes très longs (>10 min) peuvent ralentir l'analyse — ajuster `MAX_SEGMENTS_PER_RUSH`
-- Pas de gestion de la musique (le SCENARIO suggère un titre, sans l'intégrer)
+- **Pas d'audio du tout** : `has_audio` est relevé et jamais lu. C'est le manque
+  le plus visible pour un monteur, le rythme d'un montage étant piloté par la
+  parole et la musique. La suite naturelle est d'en faire des contraintes du
+  solveur (« chaque coupe à ±80 ms d'un onset »), ce qu'un prompt ne sait pas
+  garantir et qu'un modèle CP-SAT garantit par construction
 - La détection de scènes est basée sur les I-frames ffmpeg, pas sur un modèle de vision dédié
