@@ -24,7 +24,7 @@ from src.models import AnalysisResult, EditPlan, MontageResult, VideoSegment, se
 V = {
     "probe": "1",
     "scenes": "1",
-    "thumbs": "1",
+    "thumbs": "2",  # 2 = largeur paramétrable
     "annot": "3",  # 3 = le modèle ne juge plus netteté ni exposition
     "metrics": "2",  # 2 = mouvement caméra par RANSAC, stabilité optionnelle
     "segments": "3",  # 3 = fusion des métriques locales
@@ -58,14 +58,20 @@ def _scenes(rush: str, threshold: float, max_segments: int, min_duration: float)
     return [[float(s), float(e)] for s, e in scenes]
 
 
-def _thumbs(rush: str, scenes: list[list[float]], offset: float) -> list[str]:
+def _thumbs(rush: str, scenes: list[list[float]], offset: float, width: int) -> list[str]:
+    """Vignettes pour la vision.
+
+    `width` est un paramètre du nœud et non une constante : un serveur local ne
+    facture pas au token, donc on peut lui montrer une image nettement plus
+    grande. Changer la largeur invalide `thumbs` et `annot`, pas les mesures.
+    """
     from src.video.thumbnails import extract_thumbnail
 
     stem = Path(rush).stem
     out: list[str] = []
     for i, (s, e) in enumerate(scenes):
         t = s + (e - s) * offset
-        out.append(extract_thumbnail(rush, t, f"{stem}_sc{i:03d}", width=640))
+        out.append(extract_thumbnail(rush, t, f"{stem}_sc{i:03d}_w{width}", width=width))
     return out
 
 
@@ -335,6 +341,7 @@ def build(
     max_segments_per_rush: int = 40,
     min_scene_duration: float = 0.6,
     thumbnail_offset: float = 0.3,
+    thumbnail_width: int = 640,
     metric_samples: int = 3,
     k_per_preset: int = 2,
     solver_time_limit_s: float = 15.0,
@@ -371,7 +378,7 @@ def build(
             "thumbs",
             _thumbs,
             {"rush": src, "scenes": scenes},
-            params={"offset": thumbnail_offset},
+            params={"offset": thumbnail_offset, "width": thumbnail_width},
             version=V["thumbs"],
             codec="path_list",
             label=Path(path).name,

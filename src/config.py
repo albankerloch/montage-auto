@@ -11,6 +11,18 @@ SCENARIO_MODEL = "claude-sonnet-4-6"            # needs reasoning
 CRITIC_MODEL = "claude-sonnet-4-6"              # needs reasoning
 REVISION_MODEL = "claude-haiku-4-5-20251001"    # translation, not creation
 QUALITY_MODEL = "claude-haiku-4-5-20251001"     # simple gate
+# ── VLM local (optionnel) ───────────────────────────────────────────────────
+# Préfixer un nom de modèle par "local/" le route vers un serveur compatible
+# OpenAI au lieu d'Anthropic. Le préfixe fait partie du nom, donc de la clé du
+# nœud `annot` : basculer local/cloud invalide les annotations et rien d'autre.
+LOCAL_VLM_BASE_URL = "http://localhost:8000/v1"
+LOCAL_VLM_STRUCTURED_MODE = "auto"   # auto | json_schema | guided_json | prompt
+LOCAL_VLM_TIMEOUT_S = 300.0
+# Un serveur local ne facture pas au token : on peut lui montrer une image bien
+# plus grande qu'à l'API, donc lui poser des questions auxquelles 640 px ne
+# permettaient pas de répondre.
+LOCAL_THUMBNAIL_WIDTH = 1280
+
 COMPARATOR_MODEL = "claude-sonnet-4-6"          # comparaison par paires (moteur graphe)
 
 # Paths

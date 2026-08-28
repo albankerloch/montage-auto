@@ -33,6 +33,8 @@ from src.config import (
     SOLVER_TIME_LIMIT_S,
     TARGET_MONTAGE_DURATION,
 )
+from src.agents.backends import is_local
+from src.config import LOCAL_THUMBNAIL_WIDTH
 from src.graph import Node, Store, materialize, render_plan, stale
 from src.models import AnalysisResult
 from src.usage import usage
@@ -59,6 +61,7 @@ class Run:
         cache_dir: str | Path = CACHE_DIR,
         output_dir: str | Path = OUTPUT_DIR,
         annot_model: str = ANALYZER_MODEL,
+        thumbnail_width: int | None = None,
         comparator_model: str = COMPARATOR_MODEL,
         verbose: bool = True,
     ):
@@ -75,6 +78,11 @@ class Run:
             rush_paths,
             presets=self.presets,
             annot_model=annot_model,
+            # Vignettes plus grandes quand la vision tourne en local : le coût
+            # n'est plus par token, et 640 px ne permettent pas de juger un cadre.
+            thumbnail_width=thumbnail_width
+            if thumbnail_width is not None
+            else (LOCAL_THUMBNAIL_WIDTH if is_local(annot_model) else 640),
             comparator_model=comparator_model,
             output_dir=str(output_dir),
             max_segments_per_rush=max_segments_per_rush,

@@ -1,6 +1,7 @@
 """CLI entry point for the video montage pipeline."""
 from __future__ import annotations
 import argparse
+import os
 import json
 import sys
 from pathlib import Path
@@ -8,14 +9,41 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.assemble import DEFAULT_BEAM, PRESETS
-from src.config import TARGET_MONTAGE_DURATION
+from src.config import ANALYZER_MODEL, TARGET_MONTAGE_DURATION
 
 load_dotenv()
+
+
+VIDEO_EXTENSIONS = ("*.mp4", "*.mov", "*.avi", "*.mkv", "*.MOV", "*.MP4")
+
+
+def collect_rush_paths(inputs) -> list[str]:
+    """Résout fichiers et dossiers en une liste de rushes.
+
+    Extraite de main() pour que `src.bench_annot` s'en serve au lieu de
+    reproduire la même boucle avec une liste d'extensions qui divergerait.
+    """
+    paths: list[str] = []
+    for inp in inputs:
+        p = Path(inp)
+        if p.is_dir():
+            for ext in VIDEO_EXTENSIONS:
+                paths.extend(str(f) for f in p.glob(ext))
+        elif p.is_file():
+            paths.append(str(p))
+        else:
+            print(f"Warning: {inp} is not a file or directory, skipping")
+    return paths
 
 
 def _run_graph(args, rush_paths) -> int:
     """Moteur graphe : aucune boucle, sortie classée."""
     from src.pipeline import Run, run as run_pipeline
+
+    if args.local_url:
+        os.environ["LOCAL_VLM_BASE_URL"] = args.local_url
+
+    annot_model = args.annot_model or ANALYZER_MODEL
 
     preset_names = [p.strip() for p in args.presets.split(",") if p.strip()]
 
@@ -77,6 +105,8 @@ def _run_graph(args, rush_paths) -> int:
             pinned_segments=pins,
             rank_mode=args.rank,
             pick=args.pick,
+            annot_model=annot_model,
+            thumbnail_width=args.thumbnail_width,
             verbose=False,
         )
         print(r.plan("ranked"))
@@ -98,6 +128,8 @@ def _run_graph(args, rush_paths) -> int:
             pinned_segments=pins,
             rank_mode=args.rank,
             pick=args.pick,
+            annot_model=annot_model,
+            thumbnail_width=args.thumbnail_width,
         )
     except ValueError as e:
         print(f"\nError: {e}")
@@ -143,6 +175,10 @@ Examples:
   python -m src.main rushes/ --pick 2 --ban rush_0@12.250,rush_1@3.000
   python -m src.main rushes/ --ban-file bans.json
 
+  # annotation sur un VLM local au lieu d'Anthropic
+  python -m src.main rushes/ --annot-model local/Qwen/Qwen3-VL-8B-Instruct
+  python -m src.main rushes/ --annot-model local/qwen3-vl --local-url http://localhost:11434/v1
+
   # ancienne machine à états avec boucle de révision
   python -m src.main rushes/ --engine loop --max-iter 3
         """,
@@ -176,6 +212,28 @@ Examples:
         "--no-render",
         action="store_true",
         help="Produire plan et exports NLE sans rendre le mp4 (moteur graph)",
+    )
+    parser.add_argument(
+        "--annot-model",
+        type=str,
+        default=None,
+        help="Modèle d'annotation. Préfixer par « local/ » pour viser un serveur "
+             "compatible OpenAI (vLLM, Ollama, llama.cpp, LM Studio) au lieu "
+             "d'Anthropic. Ex. : local/Qwen/Qwen3-VL-8B-Instruct",
+    )
+    parser.add_argument(
+        "--local-url",
+        type=str,
+        default=None,
+        help="URL du serveur local (défaut : LOCAL_VLM_BASE_URL, "
+             "http://localhost:8000/v1)",
+    )
+    parser.add_argument(
+        "--thumbnail-width",
+        type=int,
+        default=None,
+        help="Largeur des vignettes envoyées à la vision. Défaut : 640 en API, "
+             "1280 en local — un serveur local ne facture pas au token",
     )
     parser.add_argument(
         "--ban",
@@ -253,16 +311,7 @@ Examples:
     args = parser.parse_args()
 
     # Resolve input files
-    rush_paths = []
-    for inp in args.inputs:
-        p = Path(inp)
-        if p.is_dir():
-            for ext in ("*.mp4", "*.mov", "*.avi", "*.mkv", "*.MOV", "*.MP4"):
-                rush_paths.extend(str(f) for f in p.glob(ext))
-        elif p.is_file():
-            rush_paths.append(str(p))
-        else:
-            print(f"Warning: {inp} is not a file or directory, skipping")
+    rush_paths = collect_rush_paths(args.inputs)
 
     if not rush_paths:
         print("Error: No valid video files found.")

@@ -162,7 +162,7 @@ Deux, et deux seulement.
 
 | Agent | Nœud | Modèle | Rôle |
 |---|---|---|---|
-| `AnnotatorAgent` | `annot` | Haiku 4.5 | Tags sémantiques, émotion, rôle narratif, intérêt du plan |
+| `AnnotatorAgent` | `annot` | Haiku 4.5, ou un VLM local | Tags sémantiques, émotion, rôle narratif, intérêt du plan |
 | `ComparatorAgent` | `ranked` | Sonnet 4.6 | Comparaison par paires sur les frames de raccord |
 
 Les six agents de l'implémentation d'origine — ANALYZER, SCENARIO, CRITIC,
@@ -252,6 +252,83 @@ neutre donnerait la meilleure note aux pires plans.
 Les seuils (`_SHARP_FLOOR`, `_CLIP_TOLERANCE`, `_JITTER_TOLERANCE`) sont calés
 sur mires de synthèse. Sur de vrais rushes — grain, optique ouverte, flou
 d'arrière-plan volontaire — ils sont à revoir.
+
+### Faire tourner la vision en local
+
+Le dépôt ne dépend d'aucun runtime : il parle l'API compatible OpenAI, que
+vLLM, Ollama, llama.cpp server, LM Studio et SGLang exposent tous. La pile CUDA
+reste donc un problème d'installation du serveur, pas du projet.
+
+```bash
+vllm serve Qwen/Qwen3-VL-8B-Instruct --limit-mm-per-prompt image=4
+python -m src.main rushes/ --annot-model local/Qwen/Qwen3-VL-8B-Instruct
+python -m src.main rushes/ --annot-model local/qwen3-vl --local-url http://localhost:11434/v1
+```
+
+Le préfixe `local/` fait partie du nom du modèle, donc de la clé du nœud
+`annot` : basculer cloud ↔ local invalide les annotations et **rien d'autre**.
+`scenes`, `thumbs` et `metrics` sont conservés.
+
+**Sortie structurée.** C'est le point qui décide si ça marche. Toute
+l'architecture repose sur des contrats Pydantic ; sans décodage contraint, un
+VLM local produit du JSON invalide assez souvent pour rendre le pipeline
+inutilisable. Trois modes sont négociés puis mémorisés :
+`response_format: json_schema`, `guided_json`, puis schéma dans le prompt avec
+relance de réparation. Si aucun des deux premiers n'est accepté, l'erreur nomme
+des serveurs qui conviennent plutôt que de laisser croire que le mode dégradé
+suffit ; et un serveur qui prétend contraindre puis sort hors schéma lève, au
+lieu d'être rattrapé — le masquer cacherait une mauvaise configuration.
+Forçable avec `LOCAL_VLM_STRUCTURED_MODE`.
+
+**Vignettes.** Un serveur local ne facture pas au token : la largeur passe
+automatiquement de 640 à 1280 px (`--thumbnail-width` pour forcer). C'est un
+gain réel — 640 px ne permettent pas de juger un cadre sur un rush 4K. Changer
+la largeur invalide `thumbs` et `annot`, pas les mesures.
+
+**Coût et latence.** Les appels locaux passent par le même `UsageTracker` que
+les appels API : tokens quand le serveur les remonte, latence toujours, coût à
+0 puisque le modèle est hors grille tarifaire. C'est ce qui permet de comparer
+les deux sur autre chose que l'intuition.
+
+**Sur une carte Blackwell 16 Go (RTX 5070 Ti, sm_120)**
+
+Deux contraintes indépendantes.
+
+*L'architecture.* sm_120 n'est pas dans toutes les roues prébuilt : selon les
+versions, PyTorch, vLLM ou llama.cpp doivent être installés en build CUDA 12.8+
+ou compilés avec `-DGGML_CUDA_ARCHITECTURES=120`. Symptôme typique :
+`no kernel image is available for execution on the device`, ou un repli
+silencieux sur CPU. Vérifier avant de brancher le pipeline —
+`python -c "import torch; print(torch.cuda.get_device_capability())"` doit
+renvoyer `(12, 0)`.
+
+*La VRAM.* 16 Go tiennent confortablement un VLM de 7–8B quantifié
+(≈ 6–9 Go de poids), mais le budget se joue ailleurs : l'encodeur visuel et le
+cache KV grossissent avec le **nombre d'images par requête** et leur
+résolution. `ANNOTATE_BATCH_SIZE = 4` à 1280 px est le poste dominant. En cas
+d'OOM, réduire d'abord le lot à 2, puis la largeur, et seulement en dernier la
+taille du modèle : l'annotation dépend moins du nombre de paramètres que de la
+résolution.
+
+Les familles utilisables dans ce budget évoluent vite ; le dépôt n'en code
+aucune en dur, précisément pour cette raison.
+
+**Mesurer plutôt que supposer**
+
+```bash
+python -m src.bench_annot rushes/ \
+    --a claude-haiku-4-5-20251001 \
+    --b local/Qwen/Qwen3-VL-8B-Instruct
+```
+
+Les deux runs partagent `scenes`, `thumbs` et `metrics` : la comparaison ne
+coûte qu'une annotation. Le rapport donne l'accord champ à champ, la
+corrélation de **rang** sur les notes d'intérêt — deux modèles n'utilisant pas
+la même échelle, seul l'ordre compte pour le solveur — et surtout le Jaccard
+sur la sélection finale. C'est ce dernier qui tranche : le solveur absorbe une
+partie du bruit d'annotation, et un désaccord de 80 % sur l'émotion peut ne
+rien changer au montage. Le classement est forcé en mode manuel, sans veto ni
+pin, pour ne pas mélanger d'autres variances à celle qu'on mesure.
 
 ### Le solveur (`src/assemble.py`)
 
@@ -413,13 +490,15 @@ montage-auto/
 │   ├── assemble.py           # Modèle CP-SAT, presets, EditPlan
 │   ├── beam.py               # Faisceau, déduplication, classement par paires
 │   ├── conform.py            # Relecture d'une timeline montée, diff, vetos
+│   ├── bench_annot.py        # Comparaison de deux modèles d'annotation
 │   │
 │   ├── orchestrator.py       # Machine à états historique (--engine loop)
 │   ├── export.py             # Générateurs EDL + FCPXML
 │   ├── export_resolve.py     # Timeline directe dans Resolve (scripting API)
 │   │
 │   ├── agents/
-│   │   ├── base_agent.py     # Wrapper Anthropic (structured output)
+│   │   ├── base_agent.py     # Wrapper d'agent, délègue au backend
+│   │   ├── backends.py       # Anthropic | endpoint compatible OpenAI
 │   │   ├── annotator.py      # ANNOTATOR — alignement strict, échec explicite
 │   │   ├── comparator.py     # COMPARATOR — comparaison par paires
 │   │   ├── analyzer.py       # ANALYZER   ┐
@@ -434,7 +513,7 @@ montage-auto/
 │       ├── metrics.py        # Netteté, exposition, stabilité (OpenCV)
 │       ├── cuts.py           # Frames de part et d'autre de chaque coupe
 │       └── editor.py         # Exécuteur moviepy
-└── tests/                    # 54 tests, sans clé API
+└── tests/                    # 85 tests, sans clé API ni GPU
 ```
 
 ---
@@ -457,7 +536,11 @@ ligne de commande.
 | `DEDUPE_THRESHOLD` | `0.85` | Jaccard au-delà duquel deux candidats sont redondants |
 | `MAX_CANDIDATES` | `6` | Plafond de candidats soumis au classement |
 | `COMPARATOR_MAX_CUTS` | `4` | Raccords montrés par candidat |
-| `ANALYZER_MODEL` | Haiku 4.5 | Annotation, gros volume |
+| `ANALYZER_MODEL` | Haiku 4.5 | Annotation, gros volume (`--annot-model`) |
+| `LOCAL_VLM_BASE_URL` | `http://localhost:8000/v1` | Serveur compatible OpenAI (`--local-url`) |
+| `LOCAL_VLM_STRUCTURED_MODE` | `auto` | `auto` \| `json_schema` \| `guided_json` \| `prompt` |
+| `LOCAL_VLM_TIMEOUT_S` | `300` | Un VLM local est lent sur un lot d'images |
+| `LOCAL_THUMBNAIL_WIDTH` | `1280` | Largeur des vignettes en mode local |
 | `COMPARATOR_MODEL` | Sonnet 4.6 | Comparaison par paires |
 
 Les poids de l'objectif (`quality_weight`, `technical_weight`, `role_weight`,
@@ -475,7 +558,7 @@ Les poids de l'objectif (`quality_weight`, `technical_weight`, `role_weight`,
 pip install pytest && python -m pytest tests -q
 ```
 
-54 tests, sans clé API. Les tests de bout en bout emploient des doubles
+85 tests, sans clé API ni GPU. Les tests de bout en bout emploient des doubles
 déterministes pour les deux agents LLM et des fixtures vidéo générées par ffmpeg
 (non versionnées ; script de régénération dans `tests/fixtures/README.md`). Ils
 se skippent proprement si le dossier est vide.
@@ -525,9 +608,13 @@ noté que sur trois images, et rien de réutilisable d'un run à l'autre.
   parole et la musique. La suite naturelle est d'en faire des contraintes du
   solveur (« chaque coupe à ±80 ms d'un onset »), ce qu'un prompt ne sait pas
   garantir et qu'un modèle CP-SAT garantit par construction.
-- **Aucune inférence locale.** Les vignettes partent chez Anthropic. Basculer
-  l'annotation sur un VLM local n'invaliderait que les nœuds `annot` — le
-  paramètre existe — mais l'écart de qualité n'a pas été mesuré.
+- **Le comparateur reste dans le cloud.** L'annotation peut tourner en local
+  (`--annot-model local/…`), mais le classement par paires n'a pas d'équivalent
+  local testé : il demande un raisonnement sur plusieurs images à la fois. En
+  attendant, `--rank manual` supprime cet appel — et rend le pipeline
+  entièrement local si l'annotation l'est aussi.
+- **L'écart local/cloud n'est pas chiffré.** `src.bench_annot` existe pour le
+  mesurer, mais aucun chiffre n'a été produit sur de vrais rushes.
 - **Seuils des métriques non calibrés** sur de vrais rushes (cf. plus haut).
 - Le comparateur juge des images fixes de raccord, pas le mouvement : un faux
   raccord sur un travelling lui échappe encore.
