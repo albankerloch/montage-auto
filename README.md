@@ -78,24 +78,27 @@ nœud porte une clé `sha256(nom + version + params + clés des dépendances)`, 
 demander un artefact matérialise ce qui manque.
 
 ```
-             ┌── probe ─────────────────────────────────┐
-             │                                          │
-rush ──┬── scenes ──┬── thumbs ── annot  (Haiku, vision) ┤
-       │            │                                   ├── segments
-       └────────────┴── metrics (OpenCV, pleine réso) ───┘      │
-                                                                │
-                                         candidates (CP-SAT) ◄──┘
-                                               │
-                                               ├── alternates   (--rank manual)
-                                               │
-                                         ranked (Sonnet, paires)
-                                               │
-                                               ├── render
-                                               └── exports ───► NLE
-                                                                 │
-                                         conform ◄───────────────┘
-                                         (vetos pour le run suivant)
+rush ─┬─ probe ─────────────────────────────────┐
+      │                                         │
+      ├─ scenes ─┬─ thumbs ─── annot  (Haiku) ───┤
+      │          │                              ├─ segments ─┬─────────────┐
+      │          └─ metrics (OpenCV, réso native)│            │             │
+      └──────────────────────────────────────────┘            ▼             │
+                                                       candidates (CP-SAT)  │
+                                                              │             │
+                                                              └──► ranked ◄─┘
+                                                                     │
+                                                                     ├─ alternates
+                                                                     ├─ render
+                                                                     └─ exports ──► NLE
+                                                                                     │
+                                                                     conform ◄───────┘
 ```
+
+`ranked` s'exécute toujours, y compris en `--rank manual` : c'est le mode qui
+supprime l'appel au modèle, pas un contournement du nœud. `alternates` en dépend
+donc, et non de `candidates`. `conform` n'est pas un nœud du graphe mais un
+outil séparé, qui relit ce que le NLE a produit.
 
 Trois principes portent le reste.
 
@@ -110,6 +113,21 @@ réellement de juger : le cadre, le sujet, la valeur narrative.
 **Le monteur est une entrée du graphe.** Son veto invalide le plan, jamais
 l'annotation vision. Le cycle « je lance, je regarde, je bannis, je relance »
 coûte quelques secondes de solveur et zéro token.
+
+### Les agents
+
+Deux, et deux seulement.
+
+| Agent | Nœud | Modèle | Rôle |
+|---|---|---|---|
+| `AnnotatorAgent` | `annot` | Haiku 4.5 | Tags sémantiques, émotion, rôle narratif, intérêt du plan |
+| `ComparatorAgent` | `ranked` | Sonnet 4.6 | Comparaison par paires sur les frames de raccord |
+
+Les six agents de l'implémentation d'origine — ANALYZER, SCENARIO, CRITIC,
+REVISION, QUALITY, EDITOR — ne sont référencés que par `orchestrator.py` et
+n'existent donc que sous `--engine loop`. Une seule dépendance croisée subsiste,
+dans le bon sens : `analyzer.py` importe le contrat `SegmentSemantics` depuis
+`annotator.py`.
 
 ### Les nœuds
 
