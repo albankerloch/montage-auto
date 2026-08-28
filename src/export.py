@@ -254,11 +254,20 @@ def export_fcpxml(plan: EditPlan, output_path: str, fps: float = 25.0) -> str:
 # ── Convenience: export both ──────────────────────────────────────────────────
 
 def export_all(plan: EditPlan, output_dir: str, fps: float = 25.0) -> dict[str, str]:
-    """Export EDL and FCPXML. Returns dict of format -> file path."""
+    """Export EDL, FCPXML and the plan itself as JSON.
+    Returns dict of format -> file path.
+
+    The plan JSON is the input of `python -m src.export_resolve`, which builds
+    the timeline directly inside DaVinci Resolve through the scripting API.
+    """
     base = Path(output_dir) / _safe_name(plan.title)
     results = {}
     results["edl"]    = export_edl(plan, str(base.with_suffix(".edl")), fps)
     results["fcpxml"] = export_fcpxml(plan, str(base.with_suffix(".fcpxml")), fps)
+
+    plan_path = base.parent / f"{base.name}_plan.json"
+    plan_path.write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    results["plan"] = str(plan_path)
     return results
 
 

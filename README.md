@@ -153,6 +153,38 @@ Tous les fichiers sont générés dans le dossier `output/` :
 
 > Les deux formats référencent les fichiers sources originaux. DaVinci peut faire un conform à pleine qualité sans repasser par le mp4 rendu.
 
+### Créer la timeline directement dans Resolve (API)
+
+Sans passer par un import de fichier : le plan est construit dans le projet
+Resolve courant via l'API de scripting (import des médias dans le Media Pool,
+`CreateEmptyTimeline` + `AppendToTimeline`, in/out au fps réel de chaque clip,
+bornes re-clampées aux limites du média — garde anti-hallucination du plan LLM).
+
+Prérequis : **Resolve Studio ouvert**, projet actif, et
+`Préférences > Système > Général > External scripting using` = **Local**.
+
+```bash
+# en une passe, à la fin du pipeline
+python -m src.main rushes/ --resolve
+
+# ou après coup, depuis le plan JSON exporté par export_all()
+python -m src.export_resolve output/<titre>_plan.json
+```
+
+Hors console interne de Resolve, exposer le module de scripting :
+
+```bash
+# macOS
+export RESOLVE_SCRIPT_API="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
+# Windows (PowerShell)
+$env:RESOLVE_SCRIPT_API="$env:PROGRAMDATA\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting"
+```
+
+Limites de l'API (signalées en console, jamais silencieuses) : les fondus et
+le retime (`speed_factor ≠ 1`) ne peuvent pas être posés par
+`AppendToTimeline` — ils restent à appliquer dans Resolve (ils sont par
+ailleurs présents dans l'EDL/FCPXML exportés).
+
 ---
 
 ## Structure du projet
@@ -167,6 +199,7 @@ montage-auto/
     ├── models.py             # Contrats Pydantic entre agents
     ├── orchestrator.py       # Machine à états non-linéaire
     ├── export.py             # Générateurs EDL + FCPXML
+    ├── export_resolve.py     # Timeline directe dans Resolve (scripting API)
     ├── main.py               # Entrypoint CLI
     ├── agents/
     │   ├── base_agent.py     # Wrapper Anthropic (structured output)

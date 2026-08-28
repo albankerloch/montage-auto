@@ -43,6 +43,13 @@ Examples:
         action="store_true",
         help="Dump the final orchestration state to JSON",
     )
+    parser.add_argument(
+        "--resolve",
+        action="store_true",
+        help="After a successful run, build the timeline directly inside "
+             "DaVinci Resolve via the scripting API (Resolve must be open, "
+             "external scripting set to Local)",
+    )
 
     args = parser.parse_args()
 
@@ -88,6 +95,16 @@ Examples:
     else:
         print(f"  FAILED: {state.error}")
     print(f"{'='*60}\n")
+
+    if args.resolve and state.final_output_path and state.edit_plan:
+        print("Building timeline in DaVinci Resolve…")
+        try:
+            from src.export_resolve import build_timeline_in_resolve
+            build_timeline_in_resolve(state.edit_plan)
+        except SystemExit as e:
+            print(f"Resolve build skipped: {e}")
+        except Exception as e:
+            print(f"Resolve build failed: {e}")
 
     if args.dump_state:
         dump_path = Path("output") / f"state_{state.run_id[:8]}.json"
