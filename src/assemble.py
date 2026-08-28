@@ -21,7 +21,7 @@ from typing import Literal, Sequence
 from ortools.sat.python import cp_model
 from pydantic import BaseModel, Field
 
-from src.models import EditPlan, TimelineEdit, VideoSegment
+from src.models import EditPlan, TimelineEdit, VideoSegment, segment_key
 
 # ── Échelles sémantiques ────────────────────────────────────────────────────
 # Le LLM produit des étiquettes ; ces tables les projettent sur [0,1] pour que
@@ -220,8 +220,15 @@ def solve(
     min_diff: int = 3,
     time_limit_s: float = 15.0,
     deterministic: bool = True,
+    excluded: frozenset[str] = frozenset(),
 ) -> list[Candidate]:
     """Retourne jusqu'à `k` timelines distinctes, classées par objectif.
+
+    `excluded` retire des segments par clé, jamais en filtrant la liste passée :
+    `Pick.index` est une position dans `segments`, donc retirer un élément en
+    amont décalerait toutes les positions suivantes et les candidats
+    pointeraient vers d'autres plans. C'est le même piège que l'appariement par
+    index de l'ancien ANALYZER, et il s'était refermé pareil.
 
     `deterministic=True` n'est pas un confort : le cache de `src/graph.py` est
     adressé par contenu, donc une fonction non déterministe le rend menteur —
@@ -234,6 +241,7 @@ def solve(
         (i, s, *_trim(s, preset))
         for i, s in enumerate(segments)
         if (s.end_time - s.start_time) >= preset.min_shot
+        and segment_key(s.source_file, s.start_time) not in excluded
     ]
     if len(usable) < preset.min_shots:
         return []
@@ -386,6 +394,7 @@ def to_edit_plan(
                 "start_time": pick.start,
                 "end_time": pick.end,
                 "duration": pick.end - pick.start,
+                "source_key": segment_key(base.source_file, base.start_time),
             }
         )
 
@@ -437,8 +446,8 @@ def explain(candidate: Candidate, segments: Sequence[VideoSegment], preset: Pres
         s = segments[pick.index]
         pos = p / denom
         lines.append(
-            f"  {p:>2}. {s.source_file.rsplit('/', 1)[-1]} "
-            f"{pick.start:>7.2f}→{pick.end:<7.2f} ({pick.end - pick.start:.1f}s) "
+            f"  {p:>2}. {segment_key(s.source_file, s.start_time):<24} "
+            f"[{pick.start:.2f}→{pick.end:.2f}] ({pick.end - pick.start:.1f}s) "
             f"q={s.quality_score:.2f} {s.suggested_role}/{s.emotion} "
             f"| énergie visée {energy_curve(preset.curve, pos):.2f} "
             f"| score {_segment_score(s, pick.end - pick.start, pos, preset):.3f}"

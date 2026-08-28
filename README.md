@@ -245,6 +245,7 @@ contraintes, et que la boucle de révision était une recherche dégradée
 | Exploration | boucle CRITIC → REVISION, séquentielle | faisceau de N intentions, indépendantes |
 | Évaluation | score absolu 0–1 contre un seuil de 0.70 | comparaison par paires, sans calibration |
 | Sortie | un montage | un classement : livré + alternates |
+| Humain | absent, simulé par le CRITIC | veto, choix, arbitrage sans modèle |
 | Reprise | aucune | propriété du cache |
 | Rejouabilité | non | oui (solveur déterministe) |
 
@@ -313,13 +314,44 @@ dernière image avant chaque coupe et la première après. L'ancien CRITIC recev
 trois keyframes à 10/50/90 % du rendu — il ne voyait donc jamais une seule
 coupe, et jugeait le contenu en croyant juger le montage.
 
+### La boucle humaine
+
+Le solveur propose, le monteur dispose — et son avis rentre dans le graphe au
+même titre qu'un fichier.
+
+```bash
+# 1. sortir le faisceau sans qu'aucun modèle ne tranche
+python -m src.main rushes/ --rank manual
+#    → K timelines en EDL/FCPXML, à comparer dans Resolve sur du mouvement
+#      plutôt que sur des images fixes
+
+# 2. choisir, et retirer les plans qu'on ne veut pas voir
+python -m src.main rushes/ --pick 2 --ban rush_0@12.250,rush_1@3.000
+python -m src.main rushes/ --ban-file bans.json
+```
+
+Les clés de veto sont celles qu'affiche le rapport d'assemblage et que porte
+`source_key` dans le plan JSON exporté — pas un identifiant interne à
+reconstituer. Une clé qui ne correspond à rien fait échouer le run : l'ignorer
+rendrait un montage inchangé et laisserait croire au veto.
+
+Ce cycle coûte le solveur, soit quelques secondes et zéro token : bannir un plan
+invalide `candidates` et l'aval, jamais l'annotation vision. C'est ce que la
+machine à états ne pouvait pas faire — toute intervention humaine y imposait de
+repartir de zéro, ou de faire passer un jugement de monteur à travers
+`RevisionInstructions` pour qu'un LLM le réinterprète.
+
+`--rank manual` mérite d'être le défaut sur un vrai projet : « lequel des deux
+tu livrerais » est une question de monteur, et l'automatiser était le dernier
+endroit où un modèle jouait encore le rôle de l'humain.
+
 ## Tests
 
 ```bash
 pip install pytest && python -m pytest tests -q
 ```
 
-31 tests, sans clé API. Les tests de bout en bout utilisent des doubles
+39 tests, sans clé API. Les tests de bout en bout utilisent des doubles
 déterministes pour les deux agents LLM et des fixtures vidéo générées par
 ffmpeg ; ils se skippent si `tests/fixtures/rushes/` est vide.
 

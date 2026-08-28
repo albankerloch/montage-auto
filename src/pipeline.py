@@ -50,6 +50,8 @@ class Run:
         solver_time_limit_s: float = SOLVER_TIME_LIMIT_S,
         max_candidates: int = MAX_CANDIDATES,
         banned_segments: Sequence[str] = (),
+        rank_mode: str = "llm",
+        pick: int = 0,
         cache_dir: str | Path = CACHE_DIR,
         output_dir: str | Path = OUTPUT_DIR,
         annot_model: str = ANALYZER_MODEL,
@@ -72,6 +74,8 @@ class Run:
             k_per_preset=k_per_preset,
             solver_time_limit_s=solver_time_limit_s,
             banned_segments=banned_segments,
+            rank_mode=rank_mode,
+            pick=pick,
             dedupe_threshold=DEDUPE_THRESHOLD,
             max_candidates=max_candidates,
             target_duration=target_duration,
@@ -144,20 +148,35 @@ class Run:
 
     def report_ranking(self) -> str:
         r = self.get("ranked")
-        lines = [
-            f"Classement — {r['comparisons']} comparaison(s) par paires "
-            f"(aucune note absolue, aucun seuil)\n"
-        ]
+        if r.get("mode") == "manual":
+            lines = [
+                f"{len(r['ranked'])} candidat(s) — classement laissé au monteur "
+                f"(aucun appel modèle)\n"
+            ]
+        else:
+            lines = [
+                f"Classement — {r['comparisons']} comparaison(s) par paires "
+                f"(aucune note absolue, aucun seuil)\n"
+            ]
         for entry, plan in zip(r["ranked"], r["plans"]):
             c = entry["candidate"]
-            tag = "→ LIVRÉ" if entry["rank"] == 0 else f"  alternate {entry['rank']}"
+            if r.get("mode") == "manual":
+                tag = f"  [{entry['rank']}]"
+            else:
+                tag = "→ LIVRÉ" if entry["rank"] == 0 else f"  alternate {entry['rank']}"
             lines.append(
                 f"{tag}  {c['preset']}#{c['rank_in_preset']}  "
-                f"{len(plan['edits'])} plans · {plan['total_duration']:.1f}s · "
-                f"{entry['wins']} victoire(s)"
+                f"{len(plan['edits'])} plans · {plan['total_duration']:.1f}s"
+                + (f" · {entry['wins']} victoire(s)" if r.get("mode") != "manual" else "")
             )
-            for n in entry["notes"][:1]:
-                lines.append(f"          {n}")
+            if r.get("mode") != "manual":
+                for n in entry["notes"][:1]:
+                    lines.append(f"          {n}")
+        if r.get("mode") == "manual":
+            lines.append(
+                "\n  Importer les alternates dans le NLE, puis relancer avec "
+                "--pick N (et --ban si besoin)."
+            )
         return "\n".join(lines)
 
 
@@ -169,6 +188,7 @@ def run(
     export: bool = True,
     **kwargs,
 ) -> Run:
+    manual = kwargs.get("rank_mode") == "manual"
     r = Run(rush_paths, preset_names=preset_names, **kwargs)
 
     print("\n── Graphe ──────────────────────────────────────────────")
@@ -181,10 +201,21 @@ def run(
     print("\n── Assemblage (CP-SAT) ─────────────────────────────────")
     print(r.report_candidates())
 
-    print("── Classement (comparaison par paires) ─────────────────")
+    if manual:
+        print("── Arbitrage (aucun appel modèle) ──────────────────────")
+    else:
+        print("── Classement (comparaison par paires) ─────────────────")
     print(r.report_ranking())
 
-    targets = tuple(t for t, on in (("exports", export), ("render", render)) if on)
+    targets = tuple(
+        t
+        for t, on in (
+            ("alternates", manual),
+            ("exports", export and not manual),
+            ("render", render and not manual),
+        )
+        if on
+    )
     if targets:
         print("\n── Livrables ───────────────────────────────────────────")
         for p in r.deliver(targets):

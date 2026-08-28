@@ -55,38 +55,31 @@ def fake_annotate(rush: str, scenes, thumbs, model: str) -> list[dict]:
     return out
 
 
-def fake_rank(analysis, candidates, presets, model, max_candidates, per_preset):
-    """Double du COMPARATOR : préfère le candidat au plus grand nombre de plans."""
-    from src.assemble import Preset, to_edit_plan
-    from src.models import AnalysisResult
+class FakeComparator:
+    """Double du COMPARATOR. On ne remplace PAS le nœud `_ranked` : on remplace
+    seulement l'agent, pour que le pré-filtre, le mode manuel et la conversion
+    en EditPlan soient réellement exercés."""
 
-    segs = AnalysisResult.model_validate(analysis).segments
-    preset_map = {p["name"]: Preset.model_validate(p) for p in presets}
-    cands = beam.objective_prefilter(
-        [Candidate.model_validate(c) for c in candidates], per_preset=per_preset
-    )
-    ranked, calls = beam.rank(
-        cands,
-        lambda a, b: ("A" if len(a.picks) > len(b.picks) else "B", "double"),
-        max_candidates=max_candidates,
-    )
-    return {
-        "comparisons": calls,
-        "ranked": [r.model_dump(mode="json") for r in ranked],
-        "plans": [
-            to_edit_plan(
-                r.candidate, segs, preset_map[r.candidate.preset],
-                title=f"{r.rank + 1:02d}_{r.candidate.preset}",
-            ).model_dump(mode="json")
-            for r in ranked
-        ],
-    }
+    calls = 0
+
+    def __init__(self, model: str = ""):
+        pass
+
+    def as_callable(self, segments, presets):
+        def _cmp(a, b):
+            FakeComparator.calls += 1
+            return ("A" if len(a.picks) > len(b.picks) else "B", "double")
+
+        return _cmp
 
 
 @pytest.fixture
 def stubbed(monkeypatch):
+    import src.agents.comparator as comparator_mod
+
     monkeypatch.setattr(nodes, "_annot", fake_annotate)
-    monkeypatch.setattr(nodes, "_ranked", fake_rank)
+    monkeypatch.setattr(comparator_mod, "ComparatorAgent", FakeComparator)
+    FakeComparator.calls = 0
 
 
 @pytest.fixture
@@ -100,6 +93,9 @@ def make_run(tmp_path, stubbed):
             target_duration=kw.pop("target_duration", 20.0),
             max_segments_per_rush=kw.pop("max_segments_per_rush", 8),
             solver_time_limit_s=kw.pop("solver_time_limit_s", 5.0),
+            banned_segments=kw.pop("banned_segments", ()),
+            rank_mode=kw.pop("rank_mode", "llm"),
+            pick=kw.pop("pick", 0),
             cache_dir=tmp_path / "cache",
             output_dir=tmp_path / "out",
             verbose=False,
@@ -209,3 +205,39 @@ def test_render_duration_matches_the_plan(make_run):
     plan = EditPlan.model_validate(r.get("ranked")["plans"][0])
     actual = probe_video(r.get("render")).duration
     assert abs(actual - plan.total_duration) < 1.0, f"{actual}s rendu vs {plan.total_duration}s planifié"
+
+
+def test_pick_selects_a_different_candidate(make_run):
+    from src.models import EditPlan
+
+    r0 = make_run()
+    plans = r0.get("ranked")["plans"]
+    assert len(plans) >= 2, "il faut au moins deux candidats pour tester --pick"
+
+    r1 = make_run(pick=1)
+    rendered = EditPlan.model_validate(r1.get("ranked")["plans"][1])
+    assert Path(r1.get("render")).exists()
+    assert rendered.title != EditPlan.model_validate(plans[0]).title
+
+
+def test_ban_spares_the_vision_nodes(make_run):
+    """Le veto du monteur invalide le plan, jamais l'annotation."""
+    from src.models import AnalysisResult, segment_key
+
+    r1 = make_run()
+    r1.get("ranked")
+
+    analysis = AnalysisResult.model_validate(r1.get("segments"))
+    victim = segment_key(analysis.segments[0].source_file, analysis.segments[0].start_time)
+
+    r2 = make_run(banned_segments=[victim])
+    names = {n.name for n in r2.todo("ranked")}
+    assert names == {"candidates", "ranked"}, names
+
+    keys = [
+        e["segment"]["source_key"]
+        for plan in r2.get("ranked")["plans"]
+        for e in plan["edits"]
+    ]
+    assert keys and all(k is not None for k in keys), "le plan doit porter la clé source"
+    assert victim not in keys

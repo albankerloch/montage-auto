@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 from src.assemble import PRESETS, Candidate, Preset, to_edit_plan
 from src.graph import Node, source
-from src.models import AnalysisResult, EditPlan, MontageResult, VideoSegment
+from src.models import AnalysisResult, EditPlan, MontageResult, VideoSegment, segment_key
 
 # Versions de calcul. À incrémenter quand la *sémantique* d'un nœud change —
 # c'est la migration du cache. Le corps des fonctions n'est pas haché.
@@ -27,8 +27,9 @@ V = {
     "thumbs": "1",
     "annot": "2",  # 2 = alignement strict + échec explicite
     "segments": "2",
-    "candidates": "1",
-    "ranked": "1",
+    "candidates": "2",  # 2 = exclusion par clé, plus par filtrage de liste
+    "ranked": "3",  # 3 = mode manuel + source_key dans le plan
+    "alternates": "1",
     "render": "1",
     "exports": "1",
 }
@@ -138,15 +139,34 @@ def _candidates(
     from src.assemble import solve
 
     segs = AnalysisResult.model_validate(analysis).segments
-    if banned:
-        blocked = set(banned)
-        segs = [s for s in segs if f"{s.source_file}@{s.start_time:.3f}" not in blocked]
+
+    blocked: frozenset[str] = frozenset(banned)
+    if blocked:
+        available = {segment_key(s.source_file, s.start_time) for s in segs}
+        unknown = sorted(blocked - available)
+        if unknown:
+            # Une clé qui ne matche rien est presque toujours une faute de
+            # frappe. L'ignorer donnerait au monteur un montage identique et la
+            # conviction d'avoir banni un plan : le pire des deux mondes.
+            raise ValueError(
+                "Clé(s) de veto inconnue(s) : " + ", ".join(unknown)
+                + f"\n{len(available)} segments disponibles, p. ex. : "
+                + ", ".join(sorted(available)[:3])
+            )
 
     out: list[Candidate] = []
     for pdict in presets:
         # Les presets sont indépendants : aucune dépendance entre eux, donc
         # parallélisables tels quels (ThreadPool ou nœuds de graphe séparés).
-        out.extend(solve(segs, Preset.model_validate(pdict), k=k_per_preset, time_limit_s=time_limit_s))
+        out.extend(
+            solve(
+                segs,
+                Preset.model_validate(pdict),
+                k=k_per_preset,
+                time_limit_s=time_limit_s,
+                excluded=blocked,
+            )
+        )
     return [c.model_dump(mode="json") for c in beam.dedupe(out, threshold=dedupe_threshold)]
 
 
@@ -157,6 +177,7 @@ def _ranked(
     model: str,
     max_candidates: int,
     per_preset: int,
+    mode: str = "llm",
 ) -> dict:
     from src import beam
     from src.agents.comparator import ComparatorAgent
@@ -164,9 +185,21 @@ def _ranked(
     segs = AnalysisResult.model_validate(analysis).segments
     preset_map = {p["name"]: Preset.model_validate(p) for p in presets}
     cands = [Candidate.model_validate(c) for c in candidates]
-    cands = beam.objective_prefilter(cands, per_preset=per_preset)
+    if mode != "manual":
+        # Le pré-filtre existe pour économiser des appels au comparateur. En
+        # manuel il n'y en a aucun : on montre au monteur tout le faisceau.
+        cands = beam.objective_prefilter(cands, per_preset=per_preset)
 
-    if len(cands) <= 1:
+    if mode == "manual":
+        # « Lequel des deux tu livrerais » est une question de monteur. En mode
+        # manuel on ne la pose pas à un modèle : on sort les K candidats dans
+        # l'ordre des presets demandés et le monteur tranche dans son NLE.
+        ranked = [
+            beam.RankedCandidate(candidate=c, rank=i, wins=0, notes=["classement manuel"])
+            for i, c in enumerate(cands[:max_candidates])
+        ]
+        calls = 0
+    elif len(cands) <= 1:
         ranked = [
             beam.RankedCandidate(candidate=c, rank=i, wins=0) for i, c in enumerate(cands)
         ]
@@ -178,6 +211,7 @@ def _ranked(
         )
 
     return {
+        "mode": mode,
         "comparisons": calls,
         "ranked": [r.model_dump(mode="json") for r in ranked],
         "plans": [
@@ -190,6 +224,23 @@ def _ranked(
             for r in ranked
         ],
     }
+
+
+def _alternates(ranked: dict, output_dir: str) -> list[str]:
+    """Exporte TOUS les candidats en EDL + FCPXML.
+
+    C'est le support de l'arbitrage humain : le monteur importe les K
+    timelines dans Resolve, les compare sur du mouvement et pas sur des images
+    fixes, puis relance avec `--pick` et `--ban`.
+    """
+    from src.export import export_all
+
+    out: list[str] = []
+    for i, raw in enumerate(ranked["plans"]):
+        plan = EditPlan.model_validate(raw)
+        exports = export_all(plan, output_dir)
+        out.extend(exports[k] for k in ("edl", "fcpxml"))
+    return sorted(out)
 
 
 def _render(ranked: dict, which: int, output_dir: str) -> str:
@@ -239,6 +290,8 @@ def build(
     dedupe_threshold: float = 0.85,
     max_candidates: int = 6,
     per_preset_prefilter: int = 1,
+    rank_mode: str = "llm",
+    pick: int = 0,
     drop_failed_annotations: bool = True,
     target_duration: float = 60.0,
 ) -> dict[str, Node]:
@@ -322,15 +375,25 @@ def build(
             "model": comparator_model,
             "max_candidates": max_candidates,
             "per_preset": per_preset_prefilter,
+            "mode": rank_mode,
         },
         version=V["ranked"],
+    )
+
+    alternates = Node(
+        "alternates",
+        _alternates,
+        {"ranked": ranked},
+        params={"output_dir": output_dir},
+        version=V["alternates"],
+        codec="path_list",
     )
 
     render = Node(
         "render",
         _render,
         {"ranked": ranked},
-        params={"which": 0, "output_dir": output_dir},
+        params={"which": pick, "output_dir": output_dir},
         version=V["render"],
         codec="path",
     )
@@ -339,7 +402,7 @@ def build(
         "exports",
         _exports,
         {"ranked": ranked},
-        params={"which": 0, "output_dir": output_dir},
+        params={"which": pick, "output_dir": output_dir},
         version=V["exports"],
         codec="path_list",
     )
@@ -348,6 +411,7 @@ def build(
         "segments": segments,
         "candidates": candidates,
         "ranked": ranked,
+        "alternates": alternates,
         "render": render,
         "exports": exports,
     }

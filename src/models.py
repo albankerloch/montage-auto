@@ -1,5 +1,20 @@
 from __future__ import annotations
+from pathlib import Path
+
 from pydantic import BaseModel, Field
+
+
+def segment_key(source_file: str, start_time: float) -> str:
+    """Identifiant d'un plan, tel qu'il s'affiche dans les rapports.
+
+    C'est la poignée que le monteur recopie pour bannir ou imposer un plan. Elle
+    doit donc être exactement ce qu'il lit à l'écran : même nom, même précision.
+    La première version utilisait le chemin complet à 3 décimales tandis que le
+    rapport affichait le nom de base à 2 décimales — et, pire, la borne
+    *recadrée* plutôt que celle du segment. Trois écarts, donc un veto qui ne
+    pouvait rien matcher.
+    """
+    return f"{Path(source_file).stem}@{start_time:.3f}"
 
 
 class VideoMetadata(BaseModel):
@@ -23,6 +38,12 @@ class VideoSegment(BaseModel):
     emotion: str = Field(description="Dominant emotion: energetic, calm, tense, joyful, etc.")
     suggested_role: str = Field(description="opening, build_up, climax, resolution, outro, b_roll")
     thumbnail_path: str | None = None
+    source_key: str | None = Field(
+        default=None,
+        description="Clé du segment d'origine, avant recadrage. C'est la poignée "
+                    "de veto : sans elle, le plan exporté porte les bornes "
+                    "recadrées et le monteur ne peut plus désigner le plan source.",
+    )
 
 
 class AnalysisResult(BaseModel):

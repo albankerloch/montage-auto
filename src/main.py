@@ -18,6 +18,19 @@ def _run_graph(args, rush_paths) -> int:
     from src.pipeline import Run, run as run_pipeline
 
     preset_names = [p.strip() for p in args.presets.split(",") if p.strip()]
+
+    bans: list[str] = []
+    for raw in args.ban:
+        bans.extend(k.strip() for k in raw.split(",") if k.strip())
+    if args.ban_file:
+        ban_path = Path(args.ban_file)
+        if not ban_path.exists():
+            print(f"Error: {ban_path} introuvable")
+            return 1
+        bans.extend(json.loads(ban_path.read_text()))
+    bans = sorted(set(bans))
+    if bans:
+        print(f"Veto sur {len(bans)} plan(s) : {', '.join(bans)}\n")
     unknown = [p for p in preset_names if p not in PRESETS]
     if unknown:
         print(f"Error: preset(s) inconnu(s): {', '.join(unknown)}")
@@ -25,7 +38,15 @@ def _run_graph(args, rush_paths) -> int:
         return 1
 
     if args.explain:
-        r = Run(rush_paths, preset_names=preset_names, target_duration=args.duration, verbose=False)
+        r = Run(
+            rush_paths,
+            preset_names=preset_names,
+            target_duration=args.duration,
+            banned_segments=bans,
+            rank_mode=args.rank,
+            pick=args.pick,
+            verbose=False,
+        )
         print(r.plan("ranked"))
         todo = r.todo("ranked")
         print(f"\n{len(todo)} nœud(s) à recalculer :")
@@ -34,13 +55,24 @@ def _run_graph(args, rush_paths) -> int:
         print("\n(✓ = déjà en cache, • = à calculer)")
         return 0
 
-    r = run_pipeline(
-        rush_paths,
-        preset_names,
-        render=not args.no_render,
-        export=True,
-        target_duration=args.duration,
-    )
+    try:
+        r = run_pipeline(
+            rush_paths,
+            preset_names,
+            render=not args.no_render,
+            export=True,
+            target_duration=args.duration,
+            banned_segments=bans,
+            rank_mode=args.rank,
+            pick=args.pick,
+        )
+    except ValueError as e:
+        print(f"\nError: {e}")
+        return 1
+
+    if args.resolve and args.rank == "manual":
+        print("\n--resolve ignoré en classement manuel : choisir d'abord avec --pick.")
+        return 0
 
     if args.resolve:
         from src.export_resolve import build_timeline_in_resolve
@@ -72,6 +104,11 @@ Examples:
   python -m src.main rushes/ --engine graph
   python -m src.main rushes/ --engine graph --presets punchy,emotional_arc --duration 90
   python -m src.main rushes/ --engine graph --explain      # que recalculerait-on ?
+
+  # boucle humaine : arbitrer soi-même, puis vetoer et rejouer
+  python -m src.main rushes/ --rank manual                 # sort les K candidats en EDL
+  python -m src.main rushes/ --pick 2 --ban rush_0@12.250,rush_1@3.000
+  python -m src.main rushes/ --ban-file bans.json
 
   # ancienne machine à états avec boucle de révision
   python -m src.main rushes/ --engine loop --max-iter 3
@@ -106,6 +143,33 @@ Examples:
         "--no-render",
         action="store_true",
         help="Produire plan et exports NLE sans rendre le mp4 (moteur graph)",
+    )
+    parser.add_argument(
+        "--ban",
+        action="append",
+        default=[],
+        metavar="CLE",
+        help="Exclure un plan, par sa clé telle qu'affichée dans le rapport "
+             "(p. ex. rush_0@12.250). Répétable, ou liste séparée par des virgules",
+    )
+    parser.add_argument(
+        "--ban-file",
+        type=str,
+        default=None,
+        help="Fichier JSON contenant une liste de clés à exclure (cumulé avec --ban)",
+    )
+    parser.add_argument(
+        "--rank",
+        choices=("llm", "manual"),
+        default="llm",
+        help="llm = classement par comparaison par paires ; manual = aucun appel "
+             "modèle, les candidats sont exportés en EDL/FCPXML pour arbitrage",
+    )
+    parser.add_argument(
+        "--pick",
+        type=int,
+        default=0,
+        help="Index du candidat à rendre et exporter (défaut 0 = le premier)",
     )
     parser.add_argument(
         "--explain",
