@@ -31,6 +31,37 @@ def _run_graph(args, rush_paths) -> int:
     bans = sorted(set(bans))
     if bans:
         print(f"Veto sur {len(bans)} plan(s) : {', '.join(bans)}\n")
+
+    pins: dict[str, int | str] = {}
+    raw_pins: list[str] = []
+    for raw in args.pin:
+        raw_pins.extend(k.strip() for k in raw.split(",") if k.strip())
+    if args.pin_file:
+        pin_path = Path(args.pin_file)
+        if not pin_path.exists():
+            print(f"Error: {pin_path} introuvable")
+            return 1
+        for key, pos in json.loads(pin_path.read_text()).items():
+            raw_pins.append(f"{key}={pos}")
+    for entry in raw_pins:
+        if "=" not in entry:
+            print(f"Error: --pin attend CLE=POSITION (p. ex. rush_0@12.250=0) : {entry!r}")
+            return 1
+        key, _, pos_raw = entry.partition("=")
+        key, pos_raw = key.strip(), pos_raw.strip()
+        if pos_raw in ("first", "last"):
+            pins[key] = pos_raw
+        else:
+            try:
+                pins[key] = int(pos_raw)
+            except ValueError:
+                print(f"Error: position de pin invalide pour {key!r} : {pos_raw!r} "
+                      "(entier 0-based, ou 'first'/'last')")
+                return 1
+    if pins:
+        print(f"Pin sur {len(pins)} plan(s) : "
+              + ", ".join(f"{k}=@{v}" for k, v in sorted(pins.items())) + "\n")
+
     unknown = [p for p in preset_names if p not in PRESETS]
     if unknown:
         print(f"Error: preset(s) inconnu(s): {', '.join(unknown)}")
@@ -43,6 +74,7 @@ def _run_graph(args, rush_paths) -> int:
             preset_names=preset_names,
             target_duration=args.duration,
             banned_segments=bans,
+            pinned_segments=pins,
             rank_mode=args.rank,
             pick=args.pick,
             verbose=False,
@@ -63,6 +95,7 @@ def _run_graph(args, rush_paths) -> int:
             export=True,
             target_duration=args.duration,
             banned_segments=bans,
+            pinned_segments=pins,
             rank_mode=args.rank,
             pick=args.pick,
         )
@@ -157,6 +190,22 @@ Examples:
         type=str,
         default=None,
         help="Fichier JSON contenant une liste de clés à exclure (cumulé avec --ban)",
+    )
+    parser.add_argument(
+        "--pin",
+        action="append",
+        default=[],
+        metavar="CLE=POSITION",
+        help="Imposer un plan à une position donnée (contrainte dure du solveur, "
+             "pas une suggestion). POSITION est un entier 0-based, ou 'first'/'last' "
+             "(p. ex. rush_0@12.250=0 ou rush_0@12.250=last). Répétable, ou liste "
+             "séparée par des virgules",
+    )
+    parser.add_argument(
+        "--pin-file",
+        type=str,
+        default=None,
+        help="Fichier JSON {clé: position} (cumulé avec --pin)",
     )
     parser.add_argument(
         "--rank",

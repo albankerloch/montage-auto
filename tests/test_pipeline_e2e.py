@@ -241,3 +241,20 @@ def test_ban_spares_the_vision_nodes(make_run):
     ]
     assert keys and all(k is not None for k in keys), "le plan doit porter la clé source"
     assert victim not in keys
+
+
+def test_pin_spares_the_vision_nodes(make_run):
+    """Un pin change le plan, jamais l'annotation — même invariant que le veto."""
+    from src.models import EditPlan
+
+    r1 = make_run(preset_names=["best_of"])  # ni ouverture ni clôture imposées
+    plan0 = EditPlan.model_validate(r1.get("ranked")["plans"][0])
+    victim = plan0.edits[-1].segment.source_key
+    assert victim is not None
+
+    r2 = make_run(preset_names=["best_of"], pinned_segments={victim: 0})
+    names = {n.name for n in r2.todo("ranked")}
+    assert names == {"candidates", "ranked"}, names
+
+    plan2 = EditPlan.model_validate(r2.get("ranked")["plans"][0])
+    assert plan2.edits[0].segment.source_key == victim

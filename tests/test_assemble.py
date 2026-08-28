@@ -9,6 +9,8 @@ import random
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.assemble import (  # noqa: E402
@@ -18,7 +20,7 @@ from src.assemble import (  # noqa: E402
     solve,
     to_edit_plan,
 )
-from src.models import VideoSegment  # noqa: E402
+from src.models import VideoSegment, segment_key  # noqa: E402
 
 ROLES = ["opening", "build_up", "climax", "resolution", "outro", "b_roll"]
 EMOTIONS = ["energetic", "joyful", "tense", "neutral", "calm", "melancholic"]
@@ -146,6 +148,67 @@ def test_to_edit_plan_roundtrip():
 def test_infeasible_returns_empty_not_garbage():
     tight = Preset(name="impossible", target_duration=600, tolerance=0.0, min_shot=1.0, max_shot=2.0)
     assert solve(SEGS[:5], tight, k=1, time_limit_s=5) == []
+
+
+# ── Pin : imposer un plan à une position ────────────────────────────────────
+# `best_of` n'a ni ouverture ni clôture imposée par rôle : les seules
+# contraintes qui pourraient entrer en conflit avec un pin sont celles du pin
+# lui-même.
+
+
+def test_pin_forces_the_segment_at_that_position():
+    preset = PRESETS["best_of"]
+    baseline = solve(SEGS, preset, k=1, time_limit_s=BUDGET)[0]
+    victim = baseline.picks[-1].index  # délibérément pas déjà en position 0
+    key = segment_key(SEGS[victim].source_file, SEGS[victim].start_time)
+
+    cands = solve(SEGS, preset, k=1, time_limit_s=BUDGET, pinned={key: 0})
+    assert cands, "un pin valide ne doit pas rendre le modèle infaisable"
+    c = cands[0]
+    assert c.picks[0].index == victim
+
+
+def test_pin_first_and_last_aliases():
+    preset = PRESETS["best_of"]
+    baseline = solve(SEGS, preset, k=1, time_limit_s=BUDGET)[0]
+    first_victim = baseline.picks[-1].index
+    last_victim = baseline.picks[0].index
+    key_first = segment_key(SEGS[first_victim].source_file, SEGS[first_victim].start_time)
+    key_last = segment_key(SEGS[last_victim].source_file, SEGS[last_victim].start_time)
+
+    cands = solve(
+        SEGS, preset, k=1, time_limit_s=BUDGET,
+        pinned={key_first: "first", key_last: "last"},
+    )
+    assert cands
+    c = cands[0]
+    assert c.picks[0].index == first_victim
+    assert c.picks[-1].index == last_victim
+
+
+def test_pin_unknown_key_is_rejected():
+    preset = PRESETS["best_of"]
+    with pytest.raises(ValueError, match="inconnue"):
+        solve(SEGS, preset, k=1, time_limit_s=BUDGET, pinned={"nope@0.000": 0})
+
+
+def test_pin_out_of_range_position_is_rejected():
+    preset = PRESETS["best_of"]
+    baseline = solve(SEGS, preset, k=1, time_limit_s=BUDGET)[0]
+    victim = baseline.picks[0].index
+    key = segment_key(SEGS[victim].source_file, SEGS[victim].start_time)
+    with pytest.raises(ValueError, match="hors bornes"):
+        solve(SEGS, preset, k=1, time_limit_s=BUDGET, pinned={key: 9_999})
+
+
+def test_two_pins_on_the_same_position_are_rejected():
+    preset = PRESETS["best_of"]
+    baseline = solve(SEGS, preset, k=1, time_limit_s=BUDGET)[0]
+    a, b = baseline.picks[0].index, baseline.picks[1].index
+    key_a = segment_key(SEGS[a].source_file, SEGS[a].start_time)
+    key_b = segment_key(SEGS[b].source_file, SEGS[b].start_time)
+    with pytest.raises(ValueError, match="position"):
+        solve(SEGS, preset, k=1, time_limit_s=BUDGET, pinned={key_a: 0, key_b: 0})
 
 
 if __name__ == "__main__":

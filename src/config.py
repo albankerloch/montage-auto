@@ -34,6 +34,15 @@ DEDUPE_THRESHOLD = 0.85       # Jaccard au-delà duquel deux candidats sont redo
 MAX_CANDIDATES = 6            # plafond de candidats soumis au classement LLM
 COMPARATOR_MAX_CUTS = 4       # raccords montrés par candidat
 
+# $ / million de tokens (input, output). Indicatif — l'API ne les expose pas,
+# à vérifier sur console.anthropic.com/settings/billing si la grille change.
+# Un modèle absent de cette table est compté à $0 (coût non estimable, jamais
+# deviné) dans le rapport de `src/usage.py`.
+MODEL_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+}
+
 # Ensure output dirs exist
 OUTPUT_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)

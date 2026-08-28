@@ -35,6 +35,7 @@ from src.config import (
 )
 from src.graph import Node, Store, materialize, render_plan, stale
 from src.models import AnalysisResult
+from src.usage import usage
 
 
 class Run:
@@ -52,6 +53,7 @@ class Run:
         solver_time_limit_s: float = SOLVER_TIME_LIMIT_S,
         max_candidates: int = MAX_CANDIDATES,
         banned_segments: Sequence[str] = (),
+        pinned_segments: dict[str, "int | str"] | None = None,
         rank_mode: str = "llm",
         pick: int = 0,
         cache_dir: str | Path = CACHE_DIR,
@@ -63,6 +65,9 @@ class Run:
         self.verbose = verbose
         self.output_dir = Path(output_dir)
         self.store = Store(cache_dir)
+        # Un run = une mesure de coût. Les appels d'un run précédent (un autre
+        # test, un `Run` jeté) ne doivent pas se retrouver dans ce rapport-ci.
+        usage.reset()
         self.presets: list[Preset] = nodes.resolve_presets(
             preset_names, target_duration=target_duration
         )
@@ -77,6 +82,7 @@ class Run:
             k_per_preset=k_per_preset,
             solver_time_limit_s=solver_time_limit_s,
             banned_segments=banned_segments,
+            pinned_segments=pinned_segments,
             rank_mode=rank_mode,
             pick=pick,
             dedupe_threshold=DEDUPE_THRESHOLD,
@@ -182,6 +188,11 @@ class Run:
             )
         return "\n".join(lines)
 
+    def report_usage(self) -> str:
+        """Coût et latence des appels API de CE run (`annot`, `ranked`) — pas
+        des nœuds servis par le cache, qui n'en ont fait aucun."""
+        return usage.report()
+
 
 def run(
     rush_paths: Sequence[str],
@@ -223,5 +234,8 @@ def run(
         print("\n── Livrables ───────────────────────────────────────────")
         for p in r.deliver(targets):
             print(f"  {p}")
+
+    print("\n── Coût & latence (API, ce run) ────────────────────────")
+    print(r.report_usage())
 
     return r
